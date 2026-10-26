@@ -5,3 +5,8 @@ desc: 同步独立任务上下文与本地证据记录，不直接连接其他�
 version: v0.1.0
 author: Moebius
 repo: https://github.com/Moebius1453/astrbot-plugin-operation-context
+support_platforms:
+  - aiocqhttp
+tags:
+  - 工具
+  - 上下文
