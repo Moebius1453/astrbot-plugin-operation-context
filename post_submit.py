@@ -17,7 +17,7 @@ def validate_post(title: str, text: str) -> None:
             raise ValueError('invalid_post_payload')
 
 
-_SCRIPT = r'''import json,re,subprocess,time,uuid,xml.etree.ElementTree as E
+_SCRIPT = r'''import base64,json,re,subprocess,time,uuid,xml.etree.ElementTree as E
 payload=json.loads(PAYLOAD)
 adb=['/workspace/.local/adbdl/platform-tools/adb','-s','172.22.0.2:5555']
 def run(args,timeout=12):
@@ -44,13 +44,29 @@ def tap(node):
     if not (0<=x1<x2<=720 and 0<=y1<y2<=1184): raise RuntimeError('unsafe_target_bounds')
     focus()
     run(['shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)])
+def field(root,identifier):
+    nodes=[node for node in root.iter('node') if node.get('resource-id')==identifier]
+    if len(nodes)!=1: raise RuntimeError('editor_field_missing')
+    return nodes[0]
 if focus()!='com.max.xiaoheihe.module.bbs.post_edit.PostTabActivity': raise RuntimeError('editor_required')
 root=controls()
 type_bar=[node for node in root.iter('node') if node.get('resource-id')=='com.max.xiaoheihe:id/tv_appbar_title']
 if len(type_bar)!=1 or (type_bar[0].get('text') or '').strip()!='内容': raise RuntimeError('post_type_not_normal')
-for identifier,expected in [('com.max.xiaoheihe:id/et_title',payload['title']),('com.max.xiaoheihe:id/et_content',payload['text'])]:
-    nodes=[node for node in root.iter('node') if node.get('resource-id')==identifier]
-    if len(nodes)!=1 or nodes[0].get('text')!=expected: raise RuntimeError('editor_content_mismatch')
+if run(['shell','settings','get','secure','default_input_method']).strip()!='com.android.adbkeyboard/.AdbIME': raise RuntimeError('trusted_input_method_required')
+fields=[('com.max.xiaoheihe:id/et_title',payload['title'],'填写标题'),('com.max.xiaoheihe:id/et_content',payload['text'],'添加正文')]
+for identifier,desired,placeholder in fields:
+    node=field(root,identifier)
+    current=node.get('text')
+    if current==desired: continue
+    if current not in ('',placeholder): raise RuntimeError('existing_draft_must_not_change')
+    tap(node)
+    encoded=base64.b64encode(desired.encode('utf-8')).decode('ascii')
+    run(['shell','am','broadcast','-a','ADB_INPUT_B64','-p','com.android.adbkeyboard','--es','msg',encoded])
+    time.sleep(0.6)
+    root=controls()
+for identifier,desired,_ in fields:
+    node=field(root,identifier)
+    if node.get('text')!=desired: raise RuntimeError('editor_content_mismatch')
 buttons=[node for node in root.iter('node') if node.get('text')=='发布' and node.get('enabled')=='true']
 if len(buttons)!=1: raise RuntimeError('ambiguous_publish_button')
 tap(buttons[0])
@@ -118,7 +134,13 @@ class PostSubmitter:
             _write(directory, 'result.json', result)
             return result
         if not isinstance(envelope, dict) or envelope.get('exit_code') != 0:
-            result = {'status': 'unknown', 'error_type': 'submit_command_failed', 'object_id_verified': False}
+            detail = envelope.get('stderr') if isinstance(envelope, dict) else None
+            result = {
+                'status': 'unknown', 'error_type': 'submit_command_failed',
+                'exit_code': envelope.get('exit_code') if isinstance(envelope, dict) else None,
+                'stderr': detail[-400:] if isinstance(detail, str) else None,
+                'object_id_verified': False,
+            }
             _write(directory, 'result.json', result)
             return result
         output = envelope.get('stdout')

@@ -69,11 +69,12 @@ class PostSubmitterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_command_failure_is_unknown(self):
         async def execute(command):
-            return {'exit_code': 1}
+            return {'exit_code': 1, 'stderr': 'RuntimeError: editor_content_mismatch'}
 
         result = await PostSubmitter(execute, self.root).submit('标题', '正文')
         self.assertEqual(result['status'], 'unknown')
         self.assertEqual(result['error_type'], 'submit_command_failed')
+        self.assertIn('editor_content_mismatch', result['stderr'])
 
     async def test_exception_is_recorded_as_unknown(self):
         async def execute(command):

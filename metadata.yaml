@@ -1,10 +1,10 @@
 name: astrbot_plugin_operation_context
 display_name: 独立操作上下文
-short_desc: 独立任务上下文与本地证据记录
-desc: 同步独立任务上下文与本地证据记录，不直接连接其他记忆插件。
+short_desc: 把手机操作外包给受限执行器，原始输出不进对话
+desc: 通过固定能力和本地证据记录执行手机操作，控件树与 adb 输出留在磁盘，只把结构化结果交回主对话。
 version: v0.2.0
 author: Moebius
-repo: https://github.com/Moebius1453/astrbot-plugin-operation-context
+repo: https://github.com/Moebius1453/astrbot_plugin_operation_context
 support_platforms:
   - aiocqhttp
 tags:
