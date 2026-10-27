@@ -151,12 +151,12 @@ phone_input  post_submit  post_publish  post_delete  sandbox_agent
 
 - 只支持小黑盒包名，其他前台一律拒绝。
 - 不使用截图，也没有图片通道。uiautomator 读不出文字的页面，固定能力路径只能停下报告；自由执行路径可以用 `cmd window dump-visible-window-views` 换一种方式取控件。
-- `post_publish` 尚未真机验证；配图能力已暂时关闭，`post_images` 非空会返回 `post_images_disabled`。
-- `post_submit` 已改为自动填写标题正文，但尚未在真机完整跑通一次成功发布。
+- `post_publish` 已在真机跑通一次：准备 16 条命令、提交 confirmed、详情页读回成功。配图能力仍关闭。
+- `post_submit` 的自动填写与提交流程在同一次测试中被 `post_publish` 复用并验证。
 - 评论没有专属能力，仍由执行器按控件树自由操作，比发帖松。
 - 没有跨通道的手机互斥：主对话直接跑 adb 时插件不知情。
 - 命令闸是黑名单，只拒绝已知的破坏性命令；放行不等于安全。
-- 一次工具调用最多活到 AstrBot 的 `tool_call_timeout`（当前 120 秒，见 `data/cmd_config.json` 的 `provider_settings`）。插件留了十秒余量自行收尾，但 `max_steps` 要到 30 必须把这个全局值调大，否则一轮几秒的模型调用撑不到那么多步。
+- 一次工具调用最多活到 AstrBot 的 `tool_call_timeout`（当前 120 秒，见 `data/cmd_config.json` 的 `provider_settings`）。插件留了十秒余量自行收尾。实测一次发帖准备 55 秒、一次评论 64 秒，都在这条线以内，不需要调大全局值。
 - 没有检测真人接管手机。手机目前只有执行器在用，这条规则等出现并发使用者再做。
 - 状态未知一律不重试，需要人工或主对话先观察确认。
 - 尚未完成干净环境部署与长期无人看护验收。
