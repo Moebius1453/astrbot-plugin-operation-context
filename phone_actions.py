@@ -24,6 +24,11 @@ _DUMP_GUARD = r'''def controls():
     return root
 '''
 
+_LABEL_NORMALIZER = r'''def norm(value):
+    kept=[ch for ch in (value or '') if not (0xE000<=ord(ch)<=0xF8FF or 0xF0000<=ord(ch)<=0xFFFFD or 0x100000<=ord(ch)<=0x10FFFD or ord(ch) in (0x200B,0x200C,0x200D,0x200E,0x200F,0xFEFF))]
+    return ''.join(kept).strip()
+'''
+
 _TAP_SCRIPT = r'''import json,re,subprocess,uuid,xml.etree.ElementTree as E
 payload=json.loads(PAYLOAD)
 adb=[''' + _ADB + r''']
@@ -31,11 +36,12 @@ def run(args,timeout=12):
     r=subprocess.run(adb+args,capture_output=True,text=True,timeout=timeout)
     if r.returncode: raise RuntimeError('phone_command_failed')
     return r.stdout
-''' + _FOCUS_GUARD + _DUMP_GUARD + r'''focus()
+''' + _LABEL_NORMALIZER + _FOCUS_GUARD + _DUMP_GUARD + r'''focus()
 root=controls()
 parents={child:parent for parent in root.iter() for child in parent}
 if payload['attr']=='text':
-    hits=[node for node in root.iter('node') if node.get('text')==payload['target'] or node.get('content-desc')==payload['target']]
+    wanted=norm(payload['target'])
+    hits=[node for node in root.iter('node') if norm(node.get('text'))==wanted or norm(node.get('content-desc'))==wanted]
 else:
     hits=[node for node in root.iter('node') if node.get('resource-id')==payload['target']]
 if len(hits)!=1: raise RuntimeError('missing_or_ambiguous_target')

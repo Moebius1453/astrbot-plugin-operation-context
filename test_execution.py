@@ -273,6 +273,31 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call[0] for call in self.backend.calls], ['phone_screenshot', 'phone_tap_at'])
         self.assertEqual(result['action_count'], 2)
 
+    async def test_pre_action_failure_does_not_kill_the_task(self):
+        class Ambiguous(Backend):
+            async def execute(self, name, args=None):
+                self.calls.append((name, args))
+                if name == 'phone_observe':
+                    return await super().execute(name, args)
+                if args == {'target': 'epoxy_row'}:
+                    raise ValueError('pre_action:missing_or_ambiguous_target')
+                return {'action': 'tap', 'bounds': [0, 0, 10, 10]}
+
+        planner = Planner([
+            response(['phone_observe']),
+            response(['phone_tap'], [{'target': 'epoxy_row'}]),
+            response(['phone_tap'], [{'target': 'x'}]),
+            response([]),
+        ])
+        backend = Ambiguous()
+        result = await self.executor.run(
+            context=planner, provider_id='p', goal='g',
+            actions=('phone_observe', 'phone_tap'), backend=backend,
+        )
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual(result['action_count'], 1)
+        self.assertEqual(result['actions_taken'][0]['result'], {'action': 'tap', 'bounds': [0, 0, 10, 10]})
+
     async def test_batch_validated_before_any_action(self):
         result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))
         self.assertEqual(result['status'], 'rejected')

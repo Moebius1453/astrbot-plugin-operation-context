@@ -64,6 +64,19 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((record / 'commands.jsonl').exists())
         self.assertTrue((record / 'result.json').exists())
 
+    async def test_multiple_commands_in_one_turn_are_allowed(self):
+        planner = Planner([
+            SimpleNamespace(tools_call_name=['sandbox_shell', 'sandbox_shell'],
+                            tools_call_args=[{'command': 'echo a'}, {'command': 'echo b'}],
+                            completion_text=''),
+            done('两条都跑了。'),
+        ])
+        shell = Shell()
+        result = await self.run_agent(planner, shell)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['command_count'], 2)
+        self.assertEqual(shell.commands, ['echo a', 'echo b'])
+
     async def test_rejects_tools_other_than_shell(self):
         planner = Planner([SimpleNamespace(
             tools_call_name=['send_message_to_user'], tools_call_args=[{}], completion_text='')])

@@ -10,6 +10,20 @@ from xml.etree import ElementTree
 
 PACKAGE = 'com.max.xiaoheihe'
 
+_ICON_RANGES = ((0xE000, 0xF8FF), (0xF0000, 0xFFFFD), (0x100000, 0x10FFFD))
+_ZERO_WIDTH = frozenset({0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF})
+
+
+def normalize_label(value):
+    if not isinstance(value, str):
+        return ''
+    kept = [
+        character for character in value
+        if ord(character) not in _ZERO_WIDTH
+        and not any(low <= ord(character) <= high for low, high in _ICON_RANGES)
+    ]
+    return ''.join(kept).strip()
+
 
 @dataclass(frozen=True)
 class PhoneNode:

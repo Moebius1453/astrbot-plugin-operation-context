@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from unittest.mock import AsyncMock
 
-from .phone_observation import PACKAGE, PhoneNode, PhoneObservation, _ViewDecoder, describe, foreground, observe_phone, parse_window_views, parse_xml
+from .phone_observation import PACKAGE, PhoneNode, PhoneObservation, _ViewDecoder, describe, foreground, normalize_label, observe_phone, parse_window_views, parse_xml
 
 
 ACTIVITY = PACKAGE + '.module.bbs.post_edit.PostTabActivity'
@@ -106,6 +106,11 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonzero_capture_cannot_be_success(self):
         with self.assertRaises(ValueError):
             await observe_phone(AsyncMock(return_value={'exit_code': 1, 'stdout': '{}'}))
+
+    def test_normalize_label_strips_icon_glyphs(self):
+        self.assertEqual(normalize_label('内容 \uF0D7'), '内容')
+        self.assertEqual(normalize_label('\uF0D7 发布 '), '发布')
+        self.assertEqual(normalize_label(None), '')
 
     def test_content_desc_is_preserved_and_described(self):
         xml = ('<hierarchy><node package="com.max.xiaoheihe" class="android.view.View" '

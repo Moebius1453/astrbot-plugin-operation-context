@@ -25,7 +25,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(CAPABILITIES, {
             'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
             'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-            'phone_screenshot', 'phone_input', 'post_submit', 'sandbox_agent',
+            'phone_screenshot', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
         })
 
     def test_action_arguments_are_closed_set(self):
@@ -183,6 +183,21 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         })))
         with self.assertRaisesRegex(ValueError, 'invalid_screenshot_image'):
             await CapabilityBackend(shell, None).execute('phone_screenshot', {})
+
+    async def test_pre_action_failure_is_classified(self):
+        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
+            'exit_code': 1,
+            'stderr': 'Traceback (most recent call last):\nRuntimeError: missing_or_ambiguous_target',
+        })))
+        with self.assertRaisesRegex(ValueError, 'pre_action:missing_or_ambiguous_target'):
+            await CapabilityBackend(shell, None).execute('phone_tap', {'target': 'epoxy_row'})
+
+    async def test_unknown_failure_stays_fatal(self):
+        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
+            'exit_code': 1, 'stderr': 'RuntimeError: phone_command_failed',
+        })))
+        with self.assertRaisesRegex(ValueError, 'action_failed_state_unknown'):
+            await CapabilityBackend(shell, None).execute('phone_tap', {'target': 'epoxy_row'})
 
     async def test_unknown_capability_never_reaches_shell(self):
         shell = SimpleNamespace(call=AsyncMock())

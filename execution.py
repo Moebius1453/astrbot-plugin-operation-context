@@ -7,7 +7,7 @@ from typing import Callable
 
 from .adapter import ACTION_CAPABILITIES, planner_tools, validate_actions, validate_arguments
 from .evidence import EvidenceHooks
-from .phone_observation import PACKAGE
+from .phone_observation import PACKAGE, normalize_label
 
 
 QUERY_CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
@@ -47,7 +47,11 @@ def target_is_visible(tree, name, arguments):
     if not isinstance(target, str) or not target:
         return False
     if name == 'phone_tap' and arguments.get('match', 'id') == 'text':
-        return any(node.get('text') == target or node.get('desc') == target for node in nodes)
+        wanted = normalize_label(target)
+        return any(
+            normalize_label(node.get('text')) == wanted or normalize_label(node.get('desc')) == wanted
+            for node in nodes
+        )
     short = target.removeprefix(PACKAGE + ':id/')
     return any(node.get('id') == short for node in nodes)
 
@@ -75,6 +79,8 @@ ACTING
   unchanged, never rewrite, extend or shorten it, never add punctuation or mentions.
 - If a call returns unknown_target, protected_control or observe_first, nothing happened on the phone.
   Observe again or choose a different control; do not repeat the same call.
+- missing_or_ambiguous_target means the id matches several rows. Use match=text with that row's label, or take a
+  screenshot and use phone_tap_at. Never repeat the same id and expect a different result.
 
 KNOWN LAYOUT OF THIS APP
 - MainActivity: bottom navigation. The middle plus button opens the post editor directly.
@@ -239,7 +245,17 @@ class IndependentExecution:
                             last_call = signature
                             continue
                         hooks.append('capability_start', capability=name, arguments=args)
-                        observation = await asyncio.wait_for(backend.execute(name, args), timeout=tool_call_timeout)
+                        try:
+                            observation = await asyncio.wait_for(backend.execute(name, args), timeout=tool_call_timeout)
+                        except ValueError as exc:
+                            if not str(exc).startswith('pre_action:'):
+                                raise
+                            marker = str(exc).split(':', 1)[1]
+                            safe = hooks._safe({'error': marker})
+                            hooks.append('capability_end', capability=name, observation=safe)
+                            observations.append({'capability': name, 'source': 'tool', 'result': safe})
+                            last_call = signature
+                            continue
                         safe = hooks._safe(observation)
                         hooks.append('capability_end', capability=name, observation=safe)
                         record = {'capability': name, 'source': 'tool', 'result': safe}

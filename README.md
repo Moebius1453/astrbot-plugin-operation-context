@@ -23,9 +23,9 @@
 
 | | 主对话直接执行 | 本插件 |
 |---|---|---|
-| 谁决定每一步 | 主对话逐条决定 | 独立执行模型在固定能力集内选择 |
+| 谁决定每一步 | 主对话逐条决定 | 独立执行模型自行观察与选择 |
 | 进入对话的内容 | 命令原文、标准输出、错误 | 最终摘要、动作回执、页面分类 |
-| 可用范围 | 沙箱内全部工具 | 固定的 12 项能力 |
+| 可用范围 | 沙箱内全部工具 | 默认等同，或按 actions 收窄 |
 | 额外校验 | 无 | 前台应用、捕获前后一致、目标必须在当前控件树、文字由宿主冻结 |
 
 插件不是权限边界。主对话本身保留完整 shell，插件只负责隔离噪声与记录证据。
@@ -59,10 +59,10 @@ adb 路径优先取 `/workspace/.local/adbdl/platform-tools/adb`，缺失时回�
 ```
 sandbox_status  phone_status  phone_app_scope  phone_observe
 phone_tap  phone_tap_at  phone_swipe  phone_back  phone_home  phone_start_app
-phone_screenshot  phone_input  post_submit  sandbox_agent
+phone_screenshot  phone_input  post_submit  post_publish  post_delete  sandbox_agent
 ```
 
-`post_submit` 和 `sandbox_agent` 必须单独使用，不能与其他能力并列。
+`post_submit`、`post_publish`、`post_delete`、`sandbox_agent` 必须单独使用。不填 `actions` 时自动走自由执行。
 
 ## 使用
 
@@ -82,14 +82,24 @@ phone_screenshot  phone_input  post_submit  sandbox_agent
 | 查询 | `sandbox_status`、`phone_status`、`phone_app_scope` |
 | 观察 | `phone_observe`、`phone_screenshot` |
 | 动作 | `phone_tap`、`phone_tap_at`、`phone_swipe`、`phone_back`、`phone_home`、`phone_start_app`、`phone_input` |
-| 发布 | `post_submit` |
+| 发布 | `post_submit`、`post_publish`、`post_delete` |
 | 自由执行 | `sandbox_agent` |
+
+### 发帖：内容与操作分离
+
+`post_publish` 一次调用完成发帖，但把决定权拆成两层：
+
+- 内容由主对话提供：`post_title`、`post_text`，可选 `post_images`（沙箱内路径）与 `post_mention`（昵称）。
+- 执行器负责准备工作：进入编辑页、确认类型、推送并选择配图、用原生选人界面 @ 人、逐字填写标题正文，然后停下，禁止点击发布。
+- 宿主负责提交：核对编辑器里的标题正文与冻结文本逐字一致，才点发布、处理确认框、读回详情页。
+
+准备阶段未完成时不提交，返回 `preparation_not_completed`。`post_delete` 按精确标题删除主对话自己的帖子，标题存在 `/tmp/operation-target.txt`，多条匹配时拒绝猜测。
 
 ### 两种执行模式
 
-固定能力适合目标明确的短操作：点哪里、输什么由主对话指定，副作用可预期。
+固定能力适合目标明确的短操作：点哪里、输什么由主对话指定，副作用可预期。不填 `actions` 时走另一条。
 
-目标不确定时用 `sandbox_agent`。它拿到沙箱内的 shell，像主对话一样自己观察、换方法、重试，最后只回一句结论和证据路径。截图后可用 `view_image` 把 `/workspace` 下的 PNG 真正看一眼，图片只进入执行器自身的上下文。约束写在系统提示词里：对外文字只能来自 `input_text`，不得自行发布或互动，不得碰 QQ、装包、改系统设置、清数据、起后台进程。
+不填 `actions` 就是自由执行。执行器拿到沙箱内的 shell 和 `view_image`，像主对话一样自己观察、换方法、重试，最后只回一句结论和证据路径。日常手机操作默认走这条。
 
 `sandbox_agent` 的 `external_action_status` 固定为 `unknown`，因为它能执行任意命令，宿主无法断言到底做了什么。是否发生了对外动作，需要主对话自己核对。
 
@@ -131,6 +141,7 @@ phone_screenshot  phone_input  post_submit  sandbox_agent
 - 只支持小黑盒包名，其他前台一律拒绝。
 - uiautomator 失败时观察退回系统视图流，此时没有文字也没有可用 id。动作脚本依赖 uiautomator，`phone_tap` 和 `phone_input` 在这类页面上会失败；改用 `phone_screenshot` 加 `phone_tap_at` 按像素坐标点击。
 - `phone_tap_at` 只能在同一任务内先截图再使用，坐标取自 720x1280 截图，`y` 必须小于 1184，否则是导航栏。
+- `post_publish` 尚未真机验证；配图链路需要先把沙箱图片推进手机相册并触发媒体扫描，这条路径没跑过。
 - `post_submit` 已改为自动填写标题正文，但尚未在真机完整跑通一次成功发布。
 - 评论没有专属能力，仍由执行器按控件树自由操作，比发帖松。
 - 没有跨通道的手机互斥：主对话直接跑 adb 时插件不知情。

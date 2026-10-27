@@ -74,6 +74,28 @@ class TapScriptTests(unittest.TestCase):
             exec(script, {})
         self.assertEqual(json.loads(output.getvalue())['bounds'], [0, 0, 80, 80])
 
+    def test_tap_by_text_ignores_icon_glyphs(self):
+        script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps({'attr': 'text', 'target': '内容'}, ensure_ascii=False)), 1)
+        xml = ('<hierarchy><node package="com.max.xiaoheihe" class="android.widget.TextView" '
+               'text="内容 \uF0D7" bounds="[96,69][624,114]" clickable="true" enabled="true"/></hierarchy>')
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            command = args[3:]
+            if command[:2] == ['shell', 'dumpsys']:
+                return SimpleNamespace(returncode=0, stdout=FOCUS, stderr='')
+            if command[:2] == ['shell', 'uiautomator']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if command[:2] == ['shell', 'cat']:
+                return SimpleNamespace(returncode=0, stdout=xml, stderr='')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+        output = io.StringIO()
+        with patch('subprocess.run', run), redirect_stdout(output):
+            exec(script, {})
+        self.assertEqual(json.loads(output.getvalue())['bounds'], [96, 69, 624, 114])
+
     def test_tap_reports_not_interactive_without_clickable_ancestor(self):
         script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps({'attr': 'resource-id', 'target': 'missing'})), 1)
         with patch('subprocess.run', fake_run([])), self.assertRaisesRegex(RuntimeError, 'missing_or_ambiguous_target'):

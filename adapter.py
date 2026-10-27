@@ -13,6 +13,24 @@ from .threat_detector import PromptThreatDetector
 TAINT_SCORE = 5
 _DETECTOR = PromptThreatDetector()
 
+PRE_ACTION_ERRORS = (
+    'missing_or_ambiguous_target', 'target_not_interactive', 'invalid_target_bounds',
+    'unsafe_target_bounds', 'hierarchy_unavailable', 'foreign_package',
+    'phone_outside_allowed_app', 'unsafe_coordinates', 'editor_required',
+    'post_type_not_normal', 'editor_field_missing', 'editor_content_mismatch',
+    'existing_draft_must_not_change', 'trusted_input_method_required',
+)
+
+
+def action_failure(envelope):
+    detail = envelope.get('stderr')
+    if not isinstance(detail, str):
+        return 'action_failed_state_unknown'
+    for marker in PRE_ACTION_ERRORS:
+        if marker in detail:
+            return 'pre_action:' + marker
+    return 'action_failed_state_unknown'
+
 
 def screen_observation(description: dict) -> dict:
     texts = [
@@ -37,7 +55,7 @@ SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
     'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
     'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_screenshot', 'phone_input', 'post_submit', 'sandbox_agent',
+    'phone_screenshot', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
 })
 ACTION_CAPABILITIES = frozenset({
     'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
@@ -209,7 +227,7 @@ class CapabilityBackend:
         if action in ACTION_CAPABILITIES:
             envelope = await self._envelope(action_command(action, arguments, self.frozen), 45)
             if envelope.get('exit_code') != 0:
-                raise ValueError('action_failed_state_unknown')
+                raise ValueError(action_failure(envelope))
             output = envelope.get('stdout')
             limit = 3_000_000 if action == 'phone_screenshot' else 4096
             if not isinstance(output, str) or len(output) > limit:
