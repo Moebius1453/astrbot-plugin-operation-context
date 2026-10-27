@@ -55,7 +55,8 @@ SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
     'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_events',
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'sandbox_agent',
+    'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'phone_agent',
+    'note_read', 'note_write', 'sandbox_worker',
 })
 ACTION_CAPABILITIES = frozenset({
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_input',
@@ -68,11 +69,13 @@ CAPABILITY_TIERS = {
     'phone_tap': 2, 'phone_swipe': 2, 'phone_back': 2, 'phone_home': 2,
     'phone_start_app': 2, 'phone_input': 2,
     'post_submit': 3, 'post_publish': 3, 'post_delete': 3, 'comment_publish': 3,
-    'sandbox_agent': 3,
+    'phone_agent': 3,
+    'note_read': 1, 'note_write': 2, 'sandbox_worker': 2,
 }
 # Capabilities that never share a task, whether or not they act outwardly.
 STANDALONE_CAPABILITIES = frozenset({
-    'phone_events', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'sandbox_agent',
+    'phone_events', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'phone_agent',
+    'note_read', 'note_write', 'sandbox_worker',
 })
 SHELL_NAME = 'astrbot_execute_shell'
 
@@ -130,7 +133,7 @@ def resolve_actions(actions, configured):
     the host could no longer say which part produced the result.
     """
     if actions is None or actions == []:
-        actions = ['sandbox_agent']
+        actions = ['phone_agent']
     permitted = validate_actions(actions, configured)
     alone = [name for name in permitted if name in STANDALONE_CAPABILITIES]
     if alone and len(permitted) > 1:

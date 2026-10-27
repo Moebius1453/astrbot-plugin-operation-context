@@ -12,7 +12,7 @@ from astrbot.core.provider.entities import ToolCallsResult
 from .adapter import ACTION_CAPABILITIES, planner_tools, validate_actions, validate_arguments
 from .evidence import EvidenceHooks
 from .phone_observation import PACKAGE, normalize_label
-from .sandbox_agent import compact_results
+from .subagent import compact_results
 
 
 QUERY_CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
@@ -156,7 +156,7 @@ class IndependentExecution:
             raise ValueError('invalid_goal')
         if not isinstance(provider_id, str) or not provider_id:
             raise ValueError('provider_required')
-        if type(max_steps) is not int or not 1 <= max_steps <= 24:
+        if type(max_steps) is not int or not 1 <= max_steps <= 40:
             raise ValueError('invalid_step_limit')
         if type(tool_call_timeout) is not int or not 1 <= tool_call_timeout <= 60:
             raise ValueError('invalid_tool_timeout')

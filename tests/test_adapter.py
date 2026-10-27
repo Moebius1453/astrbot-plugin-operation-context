@@ -27,7 +27,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_events',
             'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
             'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish',
-            'sandbox_agent',
+            'phone_agent', 'note_read', 'note_write', 'sandbox_worker',
         })
 
     def test_action_arguments_are_closed_set(self):
@@ -59,11 +59,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 validate_actions(actions, configured)
 
     def test_omitting_actions_means_free_execution(self):
-        self.assertEqual(resolve_actions(None, ['sandbox_agent']), (('sandbox_agent',), 'sandbox_agent'))
-        self.assertEqual(resolve_actions([], ['sandbox_agent']), (('sandbox_agent',), 'sandbox_agent'))
+        self.assertEqual(resolve_actions(None, ['phone_agent']), (('phone_agent',), 'phone_agent'))
+        self.assertEqual(resolve_actions([], ['phone_agent']), (('phone_agent',), 'phone_agent'))
 
     def test_outward_capabilities_never_share_a_task(self):
-        configured = ['post_publish', 'phone_observe', 'sandbox_agent', 'phone_back', 'phone_events']
+        configured = ['post_publish', 'phone_observe', 'phone_agent', 'phone_back', 'phone_events']
         self.assertEqual(
             resolve_actions(['post_publish'], configured), (('post_publish',), 'post_publish')
         )
@@ -76,7 +76,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         for actions in (
             ['post_publish', 'phone_observe'],
-            ['phone_back', 'sandbox_agent'],
+            ['phone_back', 'phone_agent'],
             ['phone_events', 'phone_observe'],
         ):
             with self.assertRaises(ValueError):

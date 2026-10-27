@@ -59,10 +59,11 @@ adb 路径优先取 `/workspace/.local/adbdl/platform-tools/adb`，缺失时回�
 ```
 sandbox_status  phone_status  phone_app_scope  phone_observe  phone_events
 phone_tap  phone_swipe  phone_back  phone_home  phone_start_app
-phone_input  post_submit  post_publish  post_delete  comment_publish  sandbox_agent
+phone_input  post_submit  post_publish  post_delete  comment_publish  phone_agent
+note_read  note_write  sandbox_worker
 ```
 
-`post_submit`、`post_publish`、`post_delete`、`sandbox_agent` 必须单独使用。不填 `actions` 时自动走自由执行。
+`post_submit`、`post_publish`、`post_delete`、`comment_publish`、`note_read`、`note_write`、`phone_agent`、`sandbox_worker` 必须单独使用。不填 `actions` 时走 `phone_agent`。
 
 ## 使用
 
@@ -79,11 +80,12 @@ phone_input  post_submit  post_publish  post_delete  comment_publish  sandbox_ag
 
 | 类别 | 能力 |
 |---|---|
-| 查询 | `sandbox_status`、`phone_status`、`phone_app_scope`、`phone_events` |
+| 查询 | `sandbox_status`、`phone_status`、`phone_app_scope`、`phone_events`、`note_read` |
+| 写作 | `note_write` |
 | 观察 | `phone_observe` |
 | 动作 | `phone_tap`、`phone_swipe`、`phone_back`、`phone_home`、`phone_start_app`、`phone_input` |
 | 发布 | `post_submit`、`post_publish`、`post_delete`、`comment_publish` |
-| 自由执行 | `sandbox_agent` |
+| 自由执行 | `phone_agent`（手机）、`sandbox_worker`（工作区） |
 
 能力按风险分三档。查询和观察不改状态；点击、滑动、输入、导航可撤销；发帖、删除和自由执行对外可见或能产生任意副作用，永远单独占用一次任务，不与其它能力混用。
 
@@ -105,6 +107,26 @@ phone_input  post_submit  post_publish  post_delete  comment_publish  sandbox_ag
 
 宿主随后核对：评论框里的文字必须包含冻结原文，长度不能超出原文太多，页面必须是帖子详情；对上之后才点发送，再轮询列表确认评论出现。任何一步对不上就不发，返回 `unknown` 和原因。找不到唯一的发送控件时同样不发。宁可失败，不误发。
 
+### 笔记与日记
+
+`note_read` 读一篇，`note_write` 写一篇。两个都只认她自己的目录：`shiro/notes/` 和 `shiro/diary/`，路径必须相对、必须以 `.md` 结尾、不允许 `..`。
+
+读回来的正文直接进主对话。这些是她自己写的东西，没有保密的需要，也就不必绕执行器。
+
+写入的正文走 `input_text`，由宿主原样落盘。模式必须显式给：`create` 在文件已存在时失败，`append` 追加，`replace` 先在同目录留一份带时间戳的 `.bak-` 备份再覆盖。写完回读字节数确认。
+
+不提供删除。
+
+### 沙箱子代理
+
+`sandbox_worker` 是第二条自由执行路径，和手机那条共用同一套循环，只是换了一份系统提示词。
+
+白可以像跟人说话一样描述要做的事：把这段正文写进某篇日记、读出某篇笔记的全文、整理某个目录。要写入的正文放 `input_text`，宿主写到冻结文件，执行器逐字复制。
+
+这条路径不碰手机，提示词里写明禁止 adb 和设备地址。边界靠提示词，不靠权限，越界了也不是灾难。
+
+它不适用手机那套「连续几轮没有设备动作就认输」的规则，因为写文件本来就不会产生设备动作。
+
 ### 目录结构
 
 ```
@@ -114,7 +136,7 @@ metadata.yaml        插件元信息
 app/                 实现模块
   adapter.py         能力白名单、参数校验、命令分发
   execution.py       固定能力路径的执行循环
-  sandbox_agent.py   自由执行路径与执行协议
+  subagent.py        两条自由执行路径与两份协议
   command_guard.py   自由执行路径的命令闸
   phone_*.py         控件树、动作脚本、编辑器、发布
   post_submit.py     发帖提交
@@ -149,9 +171,9 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
 
 自由执行有一条宿主侧的命令闸，在命令进入 shell 之前逐条检查：只允许连指定设备、`am broadcast` 只允许 `ADB_INPUT_B64`、拒绝清数据与改系统设置、拒绝装包和起后台进程、拒绝删除 `/tmp` 以外的目录。被拒的命令不会执行，执行器收到原因后可以换方法。命令闸是黑名单，能拦住已知的破坏性命令，不能证明放行的命令安全。
 
-`sandbox_agent` 的 `external_action_status` 固定为 `unknown`，因为它能执行任意命令，宿主无法断言到底做了什么。唯一可计数的证据是 `device_action_count`，即点击、滑动、输入、按键和广播的条数。
+`phone_agent` 的 `external_action_status` 固定为 `unknown`，因为它能执行任意命令，宿主无法断言到底做了什么。唯一可计数的证据是 `device_action_count`，即点击、滑动、输入、按键和广播的条数。
 
-### 返回结构（sandbox_agent）
+### 返回结构（phone_agent）
 
 ```json
 {
@@ -161,7 +183,7 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
   "command_count": 7,
   "device_action_count": 3,
   "external_action_status": "unknown",
-  "raw_record": "...\\sandbox_agent\\<task_id>"
+  "raw_record": "...\\phone_agent\\<task_id>"
 }
 ```
 
@@ -191,7 +213,7 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
 - 不使用截图，也没有图片通道。uiautomator 读不出文字的页面，固定能力路径只能停下报告；自由执行路径可以用 `cmd window dump-visible-window-views` 换一种方式取控件。
 - `post_publish` 已在真机跑通一次：准备 16 条命令、提交 confirmed、详情页读回成功。配图能力仍关闭。
 - `post_submit` 的自动填写与提交流程在同一次测试中被 `post_publish` 复用并验证。
-- 评论没有专属能力，仍由执行器按控件树自由操作，比发帖松。
+- 评论由 `comment_publish` 处理，宿主核对评论框内容后才发送。
 - 没有跨通道的手机互斥：主对话直接跑 adb 时插件不知情。
 - 命令闸是黑名单，只拒绝已知的破坏性命令；放行不等于安全。
 - 一次工具调用最多活到 AstrBot 的 `tool_call_timeout`（当前 120 秒，见 `data/cmd_config.json` 的 `provider_settings`）。插件留了十秒余量自行收尾。实测一次发帖准备 55 秒、一次评论 64 秒，都在这条线以内，不需要调大全局值。

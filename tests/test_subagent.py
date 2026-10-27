@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from ..app.sandbox_agent import SandboxAgent
+from ..app.subagent import SandboxAgent
 
 
 class Response:
@@ -189,12 +189,36 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('three times', result['summary'])
         self.assertEqual(result['command_count'], 3)
 
-    async def test_three_rounds_without_touching_the_phone_give_up(self):
-        planner = Planner([call('echo a'), call('echo b'), call('echo c'), call('echo d')])
+    async def test_idle_rounds_before_the_first_action_are_tolerated(self):
+        planner = Planner([call('echo a'), call('echo b'), call('echo c'), done('看完了。')])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['device_action_count'], 0)
+
+    async def test_worker_protocol_disables_the_device_idle_rule(self):
+        from ..app.subagent import SANDBOX_WORKER_PROTOCOL
+
+        planner = Planner([call(f'echo {index}') for index in range(10)] + [done('写好了。')])
+        result = await self.run_agent(
+            planner, Shell(), protocol=SANDBOX_WORKER_PROTOCOL, needs_device_action=False,
+        )
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('Do not touch the phone', planner.requests[0]['system_prompt'])
+
+    async def test_eight_rounds_without_any_action_give_up(self):
+        planner = Planner([call(f'echo {index}') for index in range(12)])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'no_action_ever')
+        self.assertEqual(result['device_action_count'], 0)
+
+    async def test_three_idle_rounds_after_acting_give_up(self):
+        tap = '/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input tap 1 1'
+        planner = Planner([call(tap), call('echo a'), call('echo b'), call('echo c'), call('echo d')])
         result = await self.run_agent(planner, Shell())
         self.assertEqual(result['status'], 'needs_parent')
         self.assertEqual(result['reason'], 'no_progress')
-        self.assertEqual(result['device_action_count'], 0)
+        self.assertEqual(result['device_action_count'], 1)
 
     async def test_three_failed_commands_give_up(self):
         class Failing:
@@ -209,12 +233,12 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_stop_request_ends_the_round_cleanly(self):
         import time
 
-        from ..app import sandbox_agent
+        from ..app import subagent
 
         planner = Planner([call('echo a') for _ in range(5)])
-        original = sandbox_agent._stop_requested_at
-        sandbox_agent._stop_requested_at = time.monotonic() + 10_000
-        self.addCleanup(setattr, sandbox_agent, '_stop_requested_at', original)
+        original = subagent._stop_requested_at
+        subagent._stop_requested_at = time.monotonic() + 10_000
+        self.addCleanup(setattr, subagent, '_stop_requested_at', original)
         result = await self.run_agent(planner, Shell())
         self.assertEqual(result['status'], 'stopped')
         self.assertEqual(result['reason'], 'parent_requested_stop')
