@@ -29,6 +29,28 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
         comment = Publication('comment', 'test-post', self.text)
         self.assertEqual((await self.chain.execute(comment, self.driver(comment, 'test-comment')))['status'], 'read_back_confirmed')
 
+    async def test_host_authorization_cannot_reset_consumed_post(self):
+        root = Path(self.temp.name) / 'host'
+        first = PublicationChain.authorized_test(root, self.post, self.text)
+        await first.execute(self.post, self.driver(self.post))
+        second = PublicationChain.authorized_test(root, self.post, self.text)
+        driver = self.driver(self.post)
+        with self.assertRaisesRegex(ValueError, 'attempt_already_consumed'):
+            await second.execute(self.post, driver)
+        driver.prepare.assert_not_called()
+
+    def test_host_authorization_rejects_new_timestamp(self):
+        root = Path(self.temp.name) / 'host'
+        PublicationChain.authorized_test(root, self.post, self.text)
+        other_text = '【测试】测试 2026-10-27 15:00:01'
+        with self.assertRaisesRegex(ValueError, 'authorization_changed'):
+            PublicationChain.authorized_test(root, Publication('post', 'own_account', other_text, other_text), other_text)
+
+    def test_test_payload_requires_only_valid_timestamp(self):
+        for text in ('【测试】测试 invented', self.text + 'extra', '【测试】测试 2026-99-27 15:00:00'):
+            with self.assertRaises(ValueError):
+                Publication('post', 'own_account', text, text).validate()
+
     async def test_unknown_never_retries(self):
         driver = self.driver(self.post)
         driver.submit.side_effect = TimeoutError()
@@ -45,7 +67,8 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
         driver.submit.assert_not_called()
 
     async def test_payload_tampering_rejected(self):
-        other = Publication('post', 'own_account', self.text + 'x', self.text + 'x')
+        other_text = '【测试】测试 2026-10-27 15:00:01'
+        other = Publication('post', 'own_account', other_text, other_text)
         driver = self.driver(other)
         with self.assertRaises(ValueError):
             await self.chain.execute(other, driver)

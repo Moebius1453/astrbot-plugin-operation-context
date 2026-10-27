@@ -10,6 +10,7 @@ from .adapter import (
     CAPABILITIES,
     CapabilityBackend,
     COMMANDS,
+    build_backend,
     planner_tools,
     validate_actions,
 )
@@ -101,6 +102,16 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 ), contextlib.redirect_stdout(output):
                     exec(_APP_SCOPE_SCRIPT, {})
                 self.assertEqual(json.loads(output.getvalue()), {'scope': expected})
+
+    def test_local_runtime_rejected_before_resolution(self):
+        context = SimpleNamespace(get_config=lambda **kwargs: {
+            'provider_settings': {'computer_use_runtime': 'local'}
+        })
+        run_context = SimpleNamespace(context=SimpleNamespace(event=SimpleNamespace(unified_msg_origin='test')))
+        with patch('astrbot.core.astr_agent_tool_exec.FunctionToolExecutor._build_handoff_toolset') as resolve:
+            with self.assertRaisesRegex(ValueError, 'sandbox_runtime_required'):
+                build_backend(run_context, context, ['astrbot_execute_shell'])
+            resolve.assert_not_called()
 
     def test_redaction(self):
         self.assertNotIn('abcd123', sanitize_text('Bearer abcd123'))

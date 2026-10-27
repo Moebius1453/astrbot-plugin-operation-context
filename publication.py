@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import re
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -17,8 +19,9 @@ class Publication:
     def validate(self):
         if self.action not in {'post', 'comment'}:
             raise ValueError('unsupported_publication')
-        if not self.text.startswith('【测试】测试 ') or len(self.text) > 80:
+        if not isinstance(self.text, str) or re.fullmatch(r'【测试】测试 \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', self.text) is None:
             raise ValueError('test_text_required')
+        datetime.strptime(self.text.removeprefix('【测试】测试 '), '%Y-%m-%d %H:%M:%S')
         if self.action == 'post':
             if self.target != 'own_account' or self.title != self.text:
                 raise ValueError('invalid_test_post')
@@ -29,7 +32,20 @@ class Publication:
         return hashlib.sha256(json.dumps(asdict(self), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+TEST_AUTHORIZATION_ID = 'user-20261027-test-post-and-comment'
+
+
 class PublicationChain:
+    @classmethod
+    def authorized_test(cls, host_data: Path, post: Publication, comment_text: str):
+        directory = host_data / 'publication_authorizations' / TEST_AUTHORIZATION_ID
+        chain = cls(directory, post, comment_text)
+        try:
+            chain.initialize()
+        except FileExistsError:
+            chain._check_authorization()
+        return chain
+
     def __init__(self, directory: Path, post: Publication, comment_text: str):
         post.validate()
         Publication('comment', 'pending_own_test_post', comment_text).validate()
