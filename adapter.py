@@ -1,54 +1,99 @@
-from astrbot.core.agent.handoff import HandoffTool
-from astrbot.core.agent.tool import ToolSet
+import json
+import shlex
+
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 
 
 TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
+CAPABILITIES = frozenset({'sandbox_status', 'phone_status'})
+SHELL_NAME = 'astrbot_execute_shell'
+
+_SANDBOX_SCRIPT = '''import json, os, shutil
+s = shutil.disk_usage('/workspace')
+print(json.dumps({'workspace_exists': os.path.isdir('/workspace'), 'free_bytes': s.free, 'total_bytes': s.total}))
+'''
+_PHONE_SCRIPT = '''import json, os, subprocess
+adb = '/workspace/.local/adbdl/platform-tools/adb'
+if not os.path.isfile(adb):
+    adb = '/usr/bin/adb'
+if not os.path.isfile(adb):
+    print(json.dumps({'state': 'client_missing'}))
+else:
+    r = subprocess.run([adb, '-s', '172.22.0.2:5555', 'get-state'], capture_output=True, text=True, timeout=10)
+    state = r.stdout.strip()
+    print(json.dumps({'state': state if state in ('device', 'offline', 'unknown') else 'unavailable', 'exit_code': r.returncode}))
+'''
+COMMANDS = {
+    'sandbox_status': 'python3 -I -c ' + shlex.quote(_SANDBOX_SCRIPT),
+    'phone_status': 'python3 -I -c ' + shlex.quote(_PHONE_SCRIPT),
+}
 
 
-def select_tools(candidates: ToolSet, configured: list[str], authorized: list[str], persona_tools) -> ToolSet:
-    if not isinstance(configured, list) or not all(isinstance(name, str) for name in configured):
-        raise TypeError('configured_tools_must_be_string_list')
-    if not isinstance(authorized, list) or not all(isinstance(name, str) for name in authorized):
-        raise TypeError('authorized_tools_snapshot_missing')
-    if persona_tools is not None and (
-        not isinstance(persona_tools, list) or not all(isinstance(name, str) for name in persona_tools)
-    ):
-        raise TypeError('invalid_persona_tools')
-    allowed = set(configured) & set(authorized)
-    if persona_tools is not None:
-        allowed &= set(persona_tools)
+def validate_actions(actions, configured):
+    if not isinstance(actions, list) or not actions or len(actions) > 2:
+        raise ValueError('actions_must_be_nonempty_list_up_to_two')
+    if not isinstance(configured, list) or not all(isinstance(x, str) for x in configured):
+        raise ValueError('invalid_capability_configuration')
+    if not all(isinstance(x, str) and x in CAPABILITIES and x in configured for x in actions):
+        raise ValueError('capability_not_authorized')
+    if len(set(actions)) != len(actions):
+        raise ValueError('duplicate_action')
+    return tuple(actions)
+
+
+def build_backend(run_context, context, authorized):
+    umo = run_context.context.event.unified_msg_origin
+    settings = context.get_config(umo=umo).get('provider_settings', {})
+    if settings.get('computer_use_runtime') != 'sandbox':
+        raise ValueError('sandbox_runtime_required')
+    if settings.get('sandbox', {}).get('booter') != 'shipyard_neo':
+        raise ValueError('shipyard_neo_required')
+    if not isinstance(authorized, list) or SHELL_NAME not in authorized:
+        raise ValueError('parent_shell_permission_required')
+    candidates = FunctionToolExecutor._build_handoff_toolset(run_context, [SHELL_NAME])
+    candidate = candidates.get_tool(SHELL_NAME) if candidates else None
+    from astrbot.core.tools.computer_tools.shell import ExecuteShellTool
+    if type(candidate) is not ExecuteShellTool or not candidate.active or candidate.is_background_task:
+        raise ValueError('trusted_shell_backend_unavailable')
+    return candidate
+
+
+class CapabilityBackend:
+    def __init__(self, shell, run_context):
+        self.shell = shell
+        self.run_context = run_context
+
+    async def execute(self, action):
+        if action not in CAPABILITIES:
+            raise ValueError('unsupported_capability')
+        raw = await self.shell.call(
+            self.run_context, command=COMMANDS[action], background=False, timeout=20,
+        )
+        envelope = json.loads(raw)
+        if not isinstance(envelope, dict) or envelope.get('exit_code') != 0:
+            raise ValueError('backend_command_failed')
+        output = envelope.get('stdout')
+        if not isinstance(output, str) or len(output) > 4096:
+            raise ValueError('invalid_backend_output')
+        data = json.loads(output)
+        if not isinstance(data, dict):
+            raise ValueError('invalid_observation')
+        if action == 'sandbox_status':
+            if type(data.get('workspace_exists')) is not bool or any(
+                type(data.get(key)) is not int or data[key] < 0 for key in ('free_bytes', 'total_bytes')
+            ):
+                raise ValueError('invalid_sandbox_status')
+            return {key: data[key] for key in ('workspace_exists', 'free_bytes', 'total_bytes')}
+        if data.get('state') not in {'device', 'offline', 'unknown', 'unavailable', 'client_missing'}:
+            raise ValueError('invalid_phone_state')
+        return {'state': data['state']}
+
+
+def planner_tools(actions):
     return ToolSet([
-        tool for tool in candidates.tools
-        if tool.name in allowed
-        and tool.name != TOOL_NAME
-        and tool.active
-        and not tool.is_background_task
-        and not isinstance(tool, HandoffTool)
+        FunctionTool(name=action, description='Request the authorized status observation.', parameters={
+            'type': 'object', 'properties': {}, 'additionalProperties': False,
+        }) for action in actions
     ])
-
-
-def build_candidates(run_context, names: list[str]) -> ToolSet:
-    # 私有运行时工具适配只集中在这里，接口变化时拒绝委派而非放宽权限。
-    tools = FunctionToolExecutor._build_handoff_toolset(run_context, names)
-    return tools if tools is not None else ToolSet()
-
-
-async def resolve_persona(context, event):
-    umo = event.unified_msg_origin
-    conversation_id = await context.conversation_manager.get_curr_conversation_id(umo)
-    if not conversation_id:
-        raise ValueError('current_conversation_missing')
-    conversation = await context.conversation_manager.get_conversation(umo, conversation_id)
-    if conversation is None:
-        raise ValueError('current_conversation_missing')
-    _, persona, _, _ = await context.persona_manager.resolve_selected_persona(
-        umo=umo,
-        conversation_persona_id=conversation.persona_id,
-        platform_name=event.get_platform_name(),
-        provider_settings=context.get_config(umo=umo).get('provider_settings', {}),
-    )
-    if not persona or not isinstance(persona.get('prompt'), str) or not persona['prompt'].strip():
-        raise ValueError('current_persona_missing')
-    return persona

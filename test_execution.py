@@ -5,137 +5,98 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from astrbot.core.agent.tool import ToolSet
-
-from .evidence import EvidenceHooks
-from .execution import IndependentExecution
+from .execution import EXECUTION_PROTOCOL, IndependentExecution
 
 
-def sanitize(text: str) -> str:
-    return text.replace('test-secret', '[redacted]')
+class Planner:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.requests = []
+
+    async def llm_generate(self, **kwargs):
+        self.requests.append(kwargs)
+        return next(self.responses)
 
 
-class FakeContext:
-    def __init__(self, *, fail=False, empty=False, missing_end=False):
-        self.history = [{'role': 'user', 'content': 'private-main-history'}]
-        self.fail = fail
-        self.empty = empty
-        self.missing_end = missing_end
-        self.received = None
+def response(names=(), args=None, text=''):
+    return SimpleNamespace(tools_call_name=list(names), tools_call_args=args if args is not None else [{} for _ in names], completion_text=text)
 
-    async def tool_loop_agent(self, **kwargs):
-        self.received = kwargs
-        kwargs['contexts'].append({'role': 'user', 'content': 'child-only'})
-        hooks = kwargs['agent_hooks']
-        tool = SimpleNamespace(name='fake_observe')
-        await hooks.on_agent_begin(None)
-        await hooks.on_tool_start(None, tool, {'token': 'test-secret'})
-        if self.fail:
-            raise RuntimeError('test-secret')
-        if not self.missing_end:
-            await hooks.on_tool_end(None, tool, {}, None)
-        response = SimpleNamespace(completion_text='' if self.empty else '我已发送。test-secret')
-        await hooks.on_agent_done(None, response)
-        return response
+
+class Backend:
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, name):
+        self.calls.append(name)
+        return {'state': 'device'}
 
 
 class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.execution = IndependentExecution(self.root, sanitize)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.executor = IndependentExecution(Path(self.directory.name), lambda text: text)
+        self.backend = Backend()
 
-    async def run_fake(self, context, task_contexts=None):
-        return await self.execution.run(
-            context=context, event=object(), provider_id='fake', goal='observe',
-            system_prompt='caller-provided-persona', tools=ToolSet(),
-            task_contexts=task_contexts if task_contexts is not None else [],
-            allowed_tool_names=frozenset(),
-        )
+    async def run_task(self, planner, **kwargs):
+        return await self.executor.run(context=planner, provider_id='fake', goal='status', actions=('phone_status',), backend=self.backend, **kwargs)
 
-    async def test_independent_messages_and_unverified_claim(self):
-        context = FakeContext()
-        task_contexts = [{'role': 'user', 'content': 'selected-task-memory'}]
-        result = await self.run_fake(context, task_contexts)
-        self.assertEqual(context.history, [{'role': 'user', 'content': 'private-main-history'}])
-        self.assertEqual(len(task_contexts), 1)
-        self.assertEqual(len(context.received['contexts']), 2)
-        self.assertEqual(result['external_action_status'], 'unverified')
-        self.assertNotIn('timeline', result)
-        self.assertNotIn('test-secret', json.dumps(result))
-        timeline = (Path(result['raw_record']) / 'timeline.jsonl').read_text(encoding='utf-8')
-        self.assertNotIn('private-main-history', timeline)
-        self.assertNotIn('test-secret', timeline)
-        records = [json.loads(line) for line in timeline.splitlines()]
-        calls = [record['call_id'] for record in records if record['kind'].startswith('tool_')]
-        self.assertEqual(calls, ['call-1', 'call-1'])
+    async def test_observation_without_final_text(self):
+        planner = Planner([response(['phone_status'])])
+        result = await self.run_task(planner)
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual(self.backend.calls, ['phone_status'])
+        request = planner.requests[0]
+        self.assertEqual(request['system_prompt'], EXECUTION_PROTOCOL)
+        self.assertEqual(request['contexts'], [])
+        self.assertNotIn('event', request)
+        self.assertNotIn('persona', request)
+        self.assertNotIn('model_report_excerpt', result)
+        self.assertFalse(result['task_goal_verified'])
 
-    async def test_exception_keeps_unknown_and_missing_end(self):
-        result = await self.run_fake(FakeContext(fail=True))
-        self.assertEqual(result['execution_status'], 'failed')
-        self.assertEqual(result['external_action_status'], 'unknown')
-        self.assertIn('tool_end_missing', result['evidence_gaps'])
-        self.assertTrue((Path(result['raw_record']) / 'result.json').exists())
+    async def test_qq_shell_and_publish_are_rejected(self):
+        for name in ['send_message_to_user', 'astrbot_execute_shell', 'phone_tap', 'publish', 'future_task']:
+            self.backend.calls.clear()
+            result = await self.run_task(Planner([response([name])]))
+            self.assertEqual(result['status'], 'rejected')
+            self.assertEqual(self.backend.calls, [])
 
-    async def test_empty_response_is_not_success(self):
-        result = await self.run_fake(FakeContext(empty=True))
-        self.assertEqual(result['execution_status'], 'failed')
+    async def test_arguments_cannot_smuggle_content_or_target(self):
+        for args in [{'text': 'invented'}, {'command': 'adb shell'}, {'target': 'qq'}, {'scope': 'host'}]:
+            result = await self.run_task(Planner([response(['phone_status'], [args])]))
+            self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(self.backend.calls, [])
 
-    async def test_missing_tool_end_is_visible(self):
-        result = await self.run_fake(FakeContext(missing_end=True))
-        self.assertIn('tool_end_missing', result['evidence_gaps'])
+    async def test_batch_validated_before_any_action(self):
+        result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))
+        self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(self.backend.calls, [])
 
-    async def test_new_tasks_do_not_overwrite_previous_records(self):
-        first = await self.run_fake(FakeContext())
-        previous = (Path(first['raw_record']) / 'result.json').read_bytes()
-        second = await self.run_fake(FakeContext())
-        self.assertNotEqual(first['task_id'], second['task_id'])
-        self.assertEqual((Path(first['raw_record']) / 'result.json').read_bytes(), previous)
+    async def test_model_claim_is_discarded(self):
+        result = await self.run_task(Planner([response(text='我替白回复QQ了')]))
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertNotIn('替白', json.dumps(result, ensure_ascii=False))
+        self.assertEqual(self.backend.calls, [])
 
-    async def test_string_history_is_rejected_before_execution(self):
-        context = FakeContext()
-        with self.assertRaises(TypeError):
-            await self.run_fake(context, 'serialized-history')
-        self.assertIsNone(context.received)
-        self.assertEqual(list(self.root.iterdir()), [])
+    async def test_failure_not_retried(self):
+        async def fail(name):
+            self.backend.calls.append(name)
+            raise TimeoutError()
+        self.backend.execute = fail
+        result = await self.run_task(Planner([response(['phone_status'])]))
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(len(self.backend.calls), 1)
 
-    async def test_invalid_message_is_rejected_before_execution(self):
-        context = FakeContext()
-        with self.assertRaises(TypeError):
-            await self.run_fake(context, ['not-a-message'])
-        self.assertIsNone(context.received)
-
-    async def test_tools_require_explicit_allowlist(self):
-        tools = ToolSet()
-        tools.tools.append(SimpleNamespace(name='not-authorized'))
-        with self.assertRaises(ValueError):
-            await self.execution.run(
-                context=FakeContext(), event=object(), provider_id='fake',
-                goal='observe', system_prompt='persona', task_contexts=[],
-                tools=tools, allowed_tool_names=frozenset(),
-            )
-
-    async def test_ambiguous_same_name_results_are_not_guessed(self):
-        hooks = EvidenceHooks(self.root, sanitize)
-        tool = SimpleNamespace(name='observe')
-        await hooks.on_tool_start(None, tool, {})
-        await hooks.on_tool_start(None, tool, {})
-        await hooks.on_tool_end(None, tool, {}, None)
-        self.assertEqual(len(hooks.pending), 2)
-        records = (hooks.directory / 'timeline.jsonl').read_text(encoding='utf-8').splitlines()
-        self.assertIsNone(json.loads(records[-1])['call_id'])
-        self.assertIn('tool_end_missing', hooks.gaps())
-
-    async def test_cancel_is_recorded_and_propagated(self):
-        class CancelContext:
-            async def tool_loop_agent(self, **kwargs):
-                raise asyncio.CancelledError()
-
+    async def test_cancel_propagates_and_records(self):
+        async def cancel(name):
+            raise asyncio.CancelledError()
+        self.backend.execute = cancel
         with self.assertRaises(asyncio.CancelledError):
-            await self.run_fake(CancelContext())
-        result_files = list(self.root.glob('*/result.json'))
-        self.assertEqual(len(result_files), 1)
-        result = json.loads(result_files[0].read_text(encoding='utf-8'))
-        self.assertEqual(result['execution_status'], 'cancelled')
-        self.assertEqual(result['external_action_status'], 'unknown')
+            await self.run_task(Planner([response(['phone_status'])]))
+        result = json.loads(next(Path(self.directory.name).glob('*/result.json')).read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'cancelled')
+
+    async def test_limits_and_goal_validated(self):
+        for kwargs in [{'max_steps': 0}, {'max_steps': True}, {'tool_call_timeout': 61}]:
+            with self.assertRaises(ValueError):
+                await self.run_task(Planner([]), **kwargs)

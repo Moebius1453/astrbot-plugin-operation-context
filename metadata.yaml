@@ -2,7 +2,7 @@ name: astrbot_plugin_operation_context
 display_name: 独立操作上下文
 short_desc: 独立任务上下文与本地证据记录
 desc: 同步独立任务上下文与本地证据记录，不直接连接其他记忆插件。
-version: v0.1.0
+version: v0.2.0
 author: Moebius
 repo: https://github.com/Moebius1453/astrbot-plugin-operation-context
 support_platforms:
