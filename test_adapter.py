@@ -24,8 +24,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_capability_set_is_narrow(self):
         self.assertEqual(CAPABILITIES, {
             'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
-            'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-            'phone_screenshot', 'phone_input', 'post_submit',
+            'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+            'phone_screenshot', 'phone_input', 'post_submit', 'sandbox_agent',
         })
 
     def test_action_arguments_are_closed_set(self):
@@ -43,6 +43,13 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 validate_arguments(action, arguments, frozen)
         self.assertEqual(validate_arguments('phone_input', {'target': 'et_editor'}, {'text': '原文'})['target'], 'et_editor')
+
+    def test_tap_at_accepts_only_integer_coordinates_in_bounds(self):
+        self.assertEqual(validate_arguments('phone_tap_at', {'x': 360, 'y': 900}, {}), {'x': 360, 'y': 900})
+        for arguments in ({'x': 720, 'y': 900}, {'x': 360, 'y': 1184}, {'x': -1, 'y': 10},
+                          {'x': True, 'y': 10}, {'x': '360', 'y': 900}, {'x': 1.5, 'y': 10}, {'x': 1}):
+            with self.assertRaises(ValueError):
+                validate_arguments('phone_tap_at', arguments, {})
 
     def test_permissions_are_closed_set(self):
         self.assertEqual(validate_actions(['phone_status'], ['phone_status']), ('phone_status',))

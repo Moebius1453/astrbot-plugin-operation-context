@@ -28,12 +28,17 @@ def response(names=(), args=None, text=''):
 class Backend:
     def __init__(self):
         self.calls = []
+        self.images = []
 
     async def execute(self, name, args=None):
         self.calls.append((name, args))
         if name == 'phone_observe':
             return {'activity': 'a', 'source': 'uiautomator', 'text_available': True, 'node_count': 2,
                     'truncated': False, 'nodes': [{'id': 'x', 'text': '目标文字'}]}
+        if name == 'phone_screenshot':
+            self.images = ['data:image/png;base64,AAA']
+            return {'action': 'screenshot', 'path': '/workspace/phone-shot-' + 'a' * 32 + '.png',
+                    'bytes': 10, 'width': 720, 'height': 1280}
         return {'state': 'device'}
 
 
@@ -254,6 +259,19 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_task(planner, actions=('phone_observe', 'phone_tap'))
         self.assertEqual([call[0] for call in self.backend.calls], ['phone_observe', 'phone_tap'])
         self.assertEqual(result['action_count'], 1)
+
+    async def test_tap_at_requires_a_screenshot_in_the_same_task(self):
+        planner = Planner([
+            response(['phone_tap_at'], [{'x': 360, 'y': 900}]),
+            response(['phone_screenshot']),
+            response(['phone_tap_at'], [{'x': 360, 'y': 900}]),
+            response([]),
+        ])
+        result = await self.run_task(
+            planner, actions=('phone_screenshot', 'phone_tap_at'), vision=True,
+        )
+        self.assertEqual([call[0] for call in self.backend.calls], ['phone_screenshot', 'phone_tap_at'])
+        self.assertEqual(result['action_count'], 2)
 
     async def test_batch_validated_before_any_action(self):
         result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))

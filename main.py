@@ -10,6 +10,7 @@ from .adapter import SNAPSHOT_KEY, TOOL_NAME, CapabilityBackend, build_backend, 
 from .execution import IndependentExecution
 from .post_submit import PostSubmitter, validate_post
 from .redaction import sanitize_text
+from .sandbox_agent import SandboxAgent
 
 
 class OperationTool(FunctionTool):
@@ -21,15 +22,18 @@ class OperationTool(FunctionTool):
                 'Prefer it over running adb yourself for phone work: raw commands and screen dumps stay '
                 'in the task record instead of the chat context. It supports status queries, read-only UI '
                 'inspection, repeated tap/swipe/back/home/start/screenshot/input, and one irreversible post '
-                'submission from frozen text supplied by the caller. It never writes messages on your behalf, '
-                'never touches QQ, never runs arbitrary commands, and cannot publish comments. '
-                'Handle anything outside this scope yourself.'
+                'submission from frozen text supplied by the caller. '
+                'For free-form phone work where the fixed capabilities are too narrow, request sandbox_agent alone: '
+                'it gets a shell inside the sandbox, works the same goal freely, and returns one short summary plus '
+                'an evidence path. Any outward text it may type must still be supplied through input_text. '
+                'It never writes messages on your behalf, never touches QQ, never runs arbitrary commands outside '
+                'the sandbox, and cannot publish comments. Handle anything outside this scope yourself.'
             ),
             parameters={
                 'type': 'object',
                 'properties': {
                     'goal': {'type': 'string', 'maxLength': 4000},
-                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_screenshot', 'phone_input', 'post_submit']}, 'minItems': 1, 'maxItems': 4, 'uniqueItems': True},
+                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_screenshot', 'phone_input', 'post_submit', 'sandbox_agent']}, 'minItems': 1, 'maxItems': 4, 'uniqueItems': True},
                     'input_text': {'type': 'string', 'maxLength': 2000, 'description': 'Required when actions include phone_input. Treated as the exact text to type; the executor must not rewrite it.'},
                     'expect_text': {'type': 'string', 'maxLength': 200, 'description': 'Optional. Text you want confirmed on the final screen. Only a boolean is returned.'},
                     'post_title': {'type': 'string', 'maxLength': 100, 'description': 'Required with post_submit. Exact post title.'},
@@ -64,6 +68,31 @@ class OperationContextPlugin(Star):
             permitted = validate_actions(actions, self.config.get('allowed_capabilities', []))
             event = run_context.context.event
             shell = build_backend(run_context, self.context, event.get_extra(SNAPSHOT_KEY))
+            if 'sandbox_agent' in permitted:
+                if permitted != ('sandbox_agent',):
+                    raise ValueError('sandbox_agent_must_be_alone')
+                if expect_text is not None or post_title is not None or post_text is not None:
+                    raise ValueError('unexpected_text_fields')
+                if input_text is not None and (
+                    not isinstance(input_text, str) or not input_text.strip() or len(input_text) > 2000
+                ):
+                    raise ValueError('invalid_input_text')
+                executor_provider = self.config.get('executor_provider')
+                if isinstance(executor_provider, str) and executor_provider.strip():
+                    agent_provider = executor_provider.strip()
+                else:
+                    agent_provider = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+                agent = SandboxAgent(
+                    shell, run_context,
+                    StarTools.get_data_dir('astrbot_plugin_operation_context') / 'sandbox_agent',
+                )
+                result = await agent.run(
+                    context=self.context, provider_id=agent_provider, goal=goal,
+                    max_steps=self.config.get('max_steps', 10),
+                    command_timeout=self.config.get('tool_call_timeout', 60),
+                    frozen_text=input_text,
+                )
+                return json.dumps(result, ensure_ascii=False)
             if 'post_submit' in permitted:
                 if permitted != ('post_submit',):
                     raise ValueError('post_submit_must_be_alone')

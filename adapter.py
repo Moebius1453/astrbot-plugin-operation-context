@@ -36,11 +36,11 @@ TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
     'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
-    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_screenshot', 'phone_input', 'post_submit',
+    'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+    'phone_screenshot', 'phone_input', 'post_submit', 'sandbox_agent',
 })
 ACTION_CAPABILITIES = frozenset({
-    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+    'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
     'phone_screenshot', 'phone_input',
 })
 SHELL_NAME = 'astrbot_execute_shell'
@@ -106,6 +106,14 @@ ACTION_SCHEMAS = {
         'required': ['target'], 'additionalProperties': False,
     },
     'phone_back': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+    'phone_tap_at': {
+        'type': 'object',
+        'properties': {
+            'x': {'type': 'integer', 'minimum': 0, 'maximum': 719},
+            'y': {'type': 'integer', 'minimum': 0, 'maximum': 1183},
+        },
+        'required': ['x', 'y'], 'additionalProperties': False,
+    },
     'phone_home': {'type': 'object', 'properties': {}, 'additionalProperties': False},
     'phone_start_app': {'type': 'object', 'properties': {}, 'additionalProperties': False},
     'phone_screenshot': {'type': 'object', 'properties': {}, 'additionalProperties': False},
@@ -132,7 +140,14 @@ def validate_arguments(action, arguments, frozen):
         raise ValueError('unknown_argument')
     if set(schema.get('required', ())) - set(arguments):
         raise ValueError('missing_argument')
-    for value in arguments.values():
+    for key, value in arguments.items():
+        spec = schema['properties'][key]
+        if spec.get('type') == 'integer':
+            if type(value) is not int:
+                raise ValueError('invalid_argument_value')
+            if not spec.get('minimum', -2**31) <= value <= spec.get('maximum', 2**31):
+                raise ValueError('invalid_argument_value')
+            continue
         if not isinstance(value, str) or not value or len(value) > 200:
             raise ValueError('invalid_argument_value')
         if any(ord(character) < 32 for character in value):

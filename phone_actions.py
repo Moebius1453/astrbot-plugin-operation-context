@@ -52,6 +52,20 @@ run(['shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)])
 print(json.dumps({'tap_attempted':True,'bounds':[x1,y1,x2,y2]}))
 '''
 
+_TAP_AT_SCRIPT = r'''import json,re,subprocess
+payload=json.loads(PAYLOAD)
+adb=[''' + _ADB + r''']
+def run(args,timeout=12):
+    r=subprocess.run(adb+args,capture_output=True,text=True,timeout=timeout)
+    if r.returncode: raise RuntimeError('phone_command_failed')
+    return r.stdout
+''' + _FOCUS_GUARD + r'''x,y=payload['x'],payload['y']
+if not (0<=x<720 and 0<=y<1184): raise RuntimeError('unsafe_coordinates')
+focus()
+run(['shell','input','tap',str(x),str(y)])
+print(json.dumps({'tap_attempted':True,'x':x,'y':y}))
+'''
+
 _BACK_SCRIPT = r'''import json,re,subprocess
 adb=[''' + _ADB + r''']
 def run(args,timeout=12):
@@ -138,19 +152,21 @@ run(['shell','input','swipe']+[str(value) for value in args]+['300'])
 print(json.dumps({'swipe_attempted':True,'bounds':[x1,y1,x2,y2]}))
 '''
 
-_SCREENSHOT_SCRIPT = r'''import base64,json,subprocess,uuid
+_SCREENSHOT_SCRIPT = r'''import base64,json,struct,subprocess,uuid
 adb=[''' + _ADB + r''']
 path='/workspace/phone-shot-'+uuid.uuid4().hex+'.png'
 r=subprocess.run(adb+['exec-out','screencap','-p'],capture_output=True,timeout=20)
 if r.returncode or not r.stdout.startswith(b'\x89PNG'): raise RuntimeError('screenshot_failed')
 open(path,'wb').write(r.stdout)
-print(json.dumps({'screenshot':path,'bytes':len(r.stdout),'image':'data:image/png;base64,'+base64.b64encode(r.stdout).decode('ascii')}))
+width,height=struct.unpack('>II',r.stdout[16:24])
+print(json.dumps({'screenshot':path,'bytes':len(r.stdout),'width':width,'height':height,'image':'data:image/png;base64,'+base64.b64encode(r.stdout).decode('ascii')}))
 '''
 
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_.]+$')
 _DIRECTIONS = ('up', 'down', 'left', 'right')
 _SCRIPTS = {
     'phone_tap': _TAP_SCRIPT,
+    'phone_tap_at': _TAP_AT_SCRIPT,
     'phone_back': _BACK_SCRIPT,
     'phone_home': _HOME_SCRIPT,
     'phone_start_app': _START_SCRIPT,
@@ -176,6 +192,8 @@ def action_command(action: str, arguments: dict, frozen: dict) -> str:
         payload = json.dumps({'target': _resource_id(arguments['target']), 'text': frozen['text']}, ensure_ascii=False)
     elif action == 'phone_swipe':
         payload = json.dumps({'target': _resource_id(arguments['target']), 'direction': arguments['direction']}, ensure_ascii=False)
+    elif action == 'phone_tap_at':
+        payload = json.dumps({'x': arguments['x'], 'y': arguments['y']})
     else:
         payload = '{}'
     return 'python3 -I -c ' + shlex.quote(script.replace('PAYLOAD', repr(payload), 1))
@@ -196,6 +214,11 @@ def parse_receipt(action: str, data: dict) -> dict:
         ):
             raise ValueError('invalid_swipe_receipt')
         return {'action': 'swipe', 'bounds': bounds}
+    if action == 'phone_tap_at':
+        x, y = data.get('x'), data.get('y')
+        if data.get('tap_attempted') is not True or type(x) is not int or type(y) is not int:
+            raise ValueError('invalid_tap_at_receipt')
+        return {'action': 'tap_at', 'x': x, 'y': y}
     if action == 'phone_back':
         if data.get('back_attempted') is not True:
             raise ValueError('invalid_back_receipt')
@@ -214,7 +237,10 @@ def parse_receipt(action: str, data: dict) -> dict:
             raise ValueError('invalid_screenshot_receipt')
         if type(size) is not int or size <= 0:
             raise ValueError('invalid_screenshot_receipt')
-        return {'action': 'screenshot', 'path': path, 'bytes': size}
+        return {
+            'action': 'screenshot', 'path': path, 'bytes': size,
+            'width': data.get('width'), 'height': data.get('height'),
+        }
     verified = data.get('text_verified')
     if data.get('input_attempted') is not True or verified not in (True, False, None):
         raise ValueError('invalid_input_receipt')

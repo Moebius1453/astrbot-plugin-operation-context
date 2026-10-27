@@ -13,6 +13,7 @@ from .phone_observation import PACKAGE
 QUERY_CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
 REPEATABLE_CAPABILITIES = frozenset({'phone_observe'})
 TARGETED_CAPABILITIES = frozenset({'phone_tap', 'phone_input', 'phone_swipe'})
+SCREENSHOT_DEPENDENT = frozenset({'phone_tap_at'})
 PROTECTED_TARGETS = frozenset({'tv_appbar_title'})
 
 
@@ -59,6 +60,9 @@ PERCEPTION
 - Labels may sit in text or in desc. Both are meaningful; desc is common on custom-rendered pages.
 - If text_available is false, the tree has no labels and no usable ids. Call phone_screenshot and work from
   the image; tapping by id or text on such a screen is guessing and will fail.
+- After a screenshot you may call phone_tap_at with pixel coordinates read from the image. The screenshot is
+  720x1280; the app area ends at y=1184, below that is the navigation bar. phone_tap_at without a screenshot
+  in the same task returns screenshot_required and does nothing.
 - A screenshot is attached to your next turn as an image when vision is available. When it is not, the call
   returns only a file path you cannot read, so do not use it to inspect a screen.
 - The tree is the output of adb uiautomator, so it reflects the screen at capture time, not now.
@@ -210,6 +214,12 @@ class IndependentExecution:
                             stalled = True
                             break
                         tree = latest_tree(observations)
+                        if name in SCREENSHOT_DEPENDENT and not (vision and getattr(backend, 'images', None)):
+                            safe = hooks._safe({'error': 'screenshot_required'})
+                            hooks.append('capability_end', capability=name, observation=safe)
+                            observations.append({'capability': name, 'source': 'tool', 'result': safe})
+                            last_call = signature
+                            continue
                         if name in TARGETED_CAPABILITIES and tree is None:
                             safe = hooks._safe({'error': 'observe_first'})
                             hooks.append('capability_end', capability=name, observation=safe)

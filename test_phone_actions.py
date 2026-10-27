@@ -162,8 +162,8 @@ class ReceiptTests(unittest.TestCase):
                          {'action': 'swipe', 'bounds': [0, 0, 10, 10]})
         self.assertEqual(parse_receipt('phone_home', {'home_attempted': True}), {'action': 'home'})
         path = '/workspace/phone-shot-' + 'a' * 32 + '.png'
-        self.assertEqual(parse_receipt('phone_screenshot', {'screenshot': path, 'bytes': 12}),
-                         {'action': 'screenshot', 'path': path, 'bytes': 12})
+        self.assertEqual(parse_receipt('phone_screenshot', {'screenshot': path, 'bytes': 12, 'width': 720, 'height': 1280}),
+                         {'action': 'screenshot', 'path': path, 'bytes': 12, 'width': 720, 'height': 1280})
         for data in ({'screenshot': '/workspace/other.png', 'bytes': 12},
                      {'screenshot': path, 'bytes': 0}):
             with self.assertRaises(ValueError):

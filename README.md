@@ -58,11 +58,11 @@ adb 路径优先取 `/workspace/.local/adbdl/platform-tools/adb`，缺失时回�
 
 ```
 sandbox_status  phone_status  phone_app_scope  phone_observe
-phone_tap  phone_swipe  phone_back  phone_home  phone_start_app
-phone_screenshot  phone_input  post_submit
+phone_tap  phone_tap_at  phone_swipe  phone_back  phone_home  phone_start_app
+phone_screenshot  phone_input  post_submit  sandbox_agent
 ```
 
-`post_submit` 必须单独使用，不能与其他能力并列。
+`post_submit` 和 `sandbox_agent` 必须单独使用，不能与其他能力并列。
 
 ## 使用
 
@@ -81,8 +81,32 @@ phone_screenshot  phone_input  post_submit
 |---|---|
 | 查询 | `sandbox_status`、`phone_status`、`phone_app_scope` |
 | 观察 | `phone_observe`、`phone_screenshot` |
-| 动作 | `phone_tap`、`phone_swipe`、`phone_back`、`phone_home`、`phone_start_app`、`phone_input` |
+| 动作 | `phone_tap`、`phone_tap_at`、`phone_swipe`、`phone_back`、`phone_home`、`phone_start_app`、`phone_input` |
 | 发布 | `post_submit` |
+| 自由执行 | `sandbox_agent` |
+
+### 两种执行模式
+
+固定能力适合目标明确的短操作：点哪里、输什么由主对话指定，副作用可预期。
+
+目标不确定时用 `sandbox_agent`。它拿到沙箱内的 shell，像主对话一样自己观察、换方法、重试，最后只回一句结论和证据路径。截图后可用 `view_image` 把 `/workspace` 下的 PNG 真正看一眼，图片只进入执行器自身的上下文。约束写在系统提示词里：对外文字只能来自 `input_text`，不得自行发布或互动，不得碰 QQ、装包、改系统设置、清数据、起后台进程。
+
+`sandbox_agent` 的 `external_action_status` 固定为 `unknown`，因为它能执行任意命令，宿主无法断言到底做了什么。是否发生了对外动作，需要主对话自己核对。
+
+### 返回结构（sandbox_agent）
+
+```json
+{
+  "task_id": "...",
+  "status": "completed",
+  "summary": "手机停在编辑页，已填入标题。",
+  "command_count": 7,
+  "external_action_status": "unknown",
+  "raw_record": "...\\sandbox_agent\\<task_id>"
+}
+```
+
+每条命令及截断后的输出记录在同目录的 `commands.jsonl`。
 
 ### 返回结构
 
@@ -105,7 +129,8 @@ phone_screenshot  phone_input  post_submit
 ### 使用限制
 
 - 只支持小黑盒包名，其他前台一律拒绝。
-- uiautomator 失败时观察退回系统视图流，此时没有文字也没有可用 id。动作脚本依赖 uiautomator，这类页面上的点击和输入会失败，只能靠截图判断。
+- uiautomator 失败时观察退回系统视图流，此时没有文字也没有可用 id。动作脚本依赖 uiautomator，`phone_tap` 和 `phone_input` 在这类页面上会失败；改用 `phone_screenshot` 加 `phone_tap_at` 按像素坐标点击。
+- `phone_tap_at` 只能在同一任务内先截图再使用，坐标取自 720x1280 截图，`y` 必须小于 1184，否则是导航栏。
 - `post_submit` 已改为自动填写标题正文，但尚未在真机完整跑通一次成功发布。
 - 评论没有专属能力，仍由执行器按控件树自由操作，比发帖松。
 - 没有跨通道的手机互斥：主对话直接跑 adb 时插件不知情。
