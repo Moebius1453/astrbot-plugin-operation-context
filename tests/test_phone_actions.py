@@ -5,8 +5,8 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from .phone_actions import _TAP_SCRIPT, action_command, parse_receipt
-from .phone_observation import PACKAGE
+from ..app.phone_actions import _TAP_SCRIPT, action_command, parse_receipt
+from ..app.phone_observation import PACKAGE
 
 
 XML = (

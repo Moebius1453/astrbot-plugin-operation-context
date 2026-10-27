@@ -88,6 +88,9 @@ HARD RULES
 OUTPUT
 - Your final sentence is the only thing the parent sees. Keep it factual: what happened, what you saw,
   what is still uncertain. Say plainly when something was attempted but not confirmed.
+- If the same approach fails three times, stop retrying. Report what you tried, what the error said and
+  what you think is blocking. A clear failure report is worth more than a tenth attempt.
+- If you cannot see a way forward, stop and say so. Do not burn the remaining steps repeating yourself.
 '''
 
 SHELL_TOOL = FunctionTool(
@@ -102,9 +105,25 @@ SHELL_TOOL = FunctionTool(
 
 FROZEN_PATH = '/tmp/operation-frozen.txt'
 MAX_OUTPUT_CHARS = 6000
-MAX_SUMMARY_CHARS = 400
+MAX_SUMMARY_CHARS = 600
 KEEP_FULL_RESULTS = 8
 COMPACT_CHARS = 400
+MAX_REPEATS = 3
+MAX_IDLE_ROUNDS = 3
+MAX_FAILED_COMMANDS = 3
+
+# A stop request only applies to tasks that started before it was issued, so a
+# queued task is not killed by a stop meant for the one that just finished.
+_stop_requested_at = 0.0
+
+
+def request_stop() -> None:
+    global _stop_requested_at
+    _stop_requested_at = time.monotonic()
+
+
+def stop_requested_since(started_at: float) -> bool:
+    return _stop_requested_at > started_at
 
 
 def trim_output(text: str) -> str:
@@ -130,6 +149,22 @@ def compact_results(messages):
                 tool_call_id=messages[index].tool_call_id,
                 content=content[:COMPACT_CHARS] + '\n...[older result compacted]',
             )
+
+
+def last_commands(recent, count=3):
+    if not recent:
+        return 'No command had run yet.'
+    tail = '; '.join(f'{command[:60]} -> exit {code}' for command, code in recent[-count:])
+    return f'Last commands: {tail}'
+
+
+def describe_stop(resolution, recent):
+    lead = {
+        'repeated_command': 'Stopped: the same command ran three times.',
+        'repeated_command_failure': 'Stopped: three commands failed in a row.',
+        'no_progress': 'Stopped: three rounds made no change to the phone.',
+    }.get(resolution, 'Stopped.')
+    return (lead + ' ' + last_commands(recent))[:MAX_SUMMARY_CHARS]
 
 
 def parse_envelope(raw):
@@ -202,9 +237,15 @@ class SandboxAgent:
                 if not isinstance(value, str) or not value:
                     raise ValueError('invalid_frozen_files')
         log = CommandLog(self.evidence_root)
-        status, summary = 'step_limit', None
+        status, reason, summary = 'step_limit', None, None
         device_actions = 0
         messages = []
+        started_at = time.monotonic()
+        idle_rounds = 0
+        failure_streak = 0
+        command_counts = {}
+        recent = []
+        stop_reason = None
         try:
             if frozen_text:
                 encoded = base64.b64encode(frozen_text.encode('utf-8')).decode('ascii')
@@ -230,6 +271,12 @@ class SandboxAgent:
                 'task_rules': extra_rules,
             }, ensure_ascii=False)))
             for _ in range(max_steps):
+                round_actions = device_actions
+                if stop_requested_since(started_at):
+                    status, reason = 'stopped', 'parent_requested_stop'
+                    summary = 'Stopped at the request of the host. ' + last_commands(recent)
+                    log.append({'kind': 'stopped', 'source': 'host'})
+                    break
                 left = remaining()
                 if left is not None and left <= 15:
                     status, summary = 'time_budget', None
@@ -274,12 +321,16 @@ class SandboxAgent:
                                                 'note': 'This command was refused. Choose another method.'}),
                         ))
                         continue
-                    device_actions += count_device_actions(command)
+                    actions_here = count_device_actions(command)
+                    device_actions += actions_here
+                    command_counts[command] = command_counts.get(command, 0) + 1
                     left = remaining()
                     effective = command_timeout if left is None else max(5, min(command_timeout, int(left) - 5))
                     result = await self._shell(command, effective)
                     log.count += 1
                     log.append({'kind': 'command', 'command': command, **result})
+                    recent.append((command, result['exit_code']))
+                    failure_streak = failure_streak + 1 if result['exit_code'] not in (0, None) else 0
                     results.append(ToolCallMessageSegment(
                         tool_call_id=call_id, content=json.dumps(result, ensure_ascii=False),
                     ))
@@ -291,6 +342,20 @@ class SandboxAgent:
                         tool_calls_result=results,
                     ).to_openai_messages_model())
                     compact_results(messages)
+                    idle_rounds = idle_rounds + 1 if device_actions == round_actions else 0
+                    repeated = any(count >= MAX_REPEATS for count in command_counts.values())
+                    if repeated:
+                        stop_reason = 'repeated_command'
+                    elif failure_streak >= MAX_FAILED_COMMANDS:
+                        stop_reason = 'repeated_command_failure'
+                    elif idle_rounds >= MAX_IDLE_ROUNDS:
+                        stop_reason = 'no_progress'
+                    if stop_reason:
+                        status, reason = 'needs_parent', stop_reason
+                        summary = describe_stop(stop_reason, recent)
+                        log.append({'kind': 'gave_up', 'reason': stop_reason,
+                                    'rounds_without_action': idle_rounds})
+                        break
                 if rejected:
                     break
         except asyncio.CancelledError:
@@ -302,6 +367,7 @@ class SandboxAgent:
         result = {
             'task_id': log.task_id,
             'status': status,
+            'reason': reason,
             'summary': summary,
             'command_count': log.count,
             'device_action_count': device_actions,

@@ -6,12 +6,17 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.agent.tool import FunctionTool
 
-from .adapter import SNAPSHOT_KEY, TOOL_NAME, CapabilityBackend, build_backend, resolve_actions
-from .execution import IndependentExecution
-from .post_submit import PostSubmitter, validate_post
-from .publish import DELETE_RULES, PREPARE_RULES, build_goal, validate_publish
-from .redaction import sanitize_text
-from .sandbox_agent import SandboxAgent
+from .app.adapter import SNAPSHOT_KEY, TOOL_NAME, CapabilityBackend, build_backend, resolve_actions
+from .app.comment_submit import CommentSubmitter, validate_comment
+from .app.event_ledger import EventLedger
+from .app.execution import IndependentExecution
+from .app.notification_poll import NotificationPoller, fetch_notifications, record_dump
+from .app.post_submit import PostSubmitter, validate_post
+from .app.publish import (
+    COMMENT_RULES, DELETE_RULES, PREPARE_RULES, build_comment_goal, build_goal, validate_publish,
+)
+from .app.redaction import sanitize_text
+from .app.sandbox_agent import SandboxAgent, request_stop
 
 
 class OperationTool(FunctionTool):
@@ -29,16 +34,19 @@ class OperationTool(FunctionTool):
                 'For publishing use post_publish with post_title and post_text: the executor prepares the '
                 'whole post, then the host verifies and submits it. Attachments are not supported yet. '
                 'post_delete removes one of your own posts by exact title. post_submit commits an editor you '
-                'already filled by hand. '
+                'already filled by hand. comment_publish takes the comment body in input_text and the optional '
+                'nickname in post_mention: the executor fills the comment box and the host verifies it before '
+                'sending. phone_events reads the pending notification ledger: who replied, on which post, when. '
+                'It never opens the app and never touches the phone. '
                 'Every outward word must be supplied by you through these fields, byte for byte; the executor '
-                'never writes on your behalf, never touches QQ, and cannot publish comments. '
+                'never writes on your behalf and never touches QQ. '
                 'Handle anything outside this scope yourself.'
             ),
             parameters={
                 'type': 'object',
                 'properties': {
                     'goal': {'type': 'string', 'maxLength': 4000},
-                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent']}, 'minItems': 1, 'maxItems': 4, 'uniqueItems': True, 'description': 'Optional. Omit to let the executor work freely with a shell.'},
+                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_events', 'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'sandbox_agent']}, 'minItems': 1, 'maxItems': 4, 'uniqueItems': True, 'description': 'Optional. Omit to let the executor work freely with a shell.'},
                     'input_text': {'type': 'string', 'maxLength': 2000, 'description': 'Exact text the executor may type or publish. It must not rewrite it.'},
                     'expect_text': {'type': 'string', 'maxLength': 200, 'description': 'Optional. Text you want confirmed on the final screen. Only a boolean is returned.'},
                     'post_title': {'type': 'string', 'maxLength': 100, 'description': 'Exact title for post_submit, post_publish or the post to remove for post_delete.'},
@@ -84,20 +92,69 @@ class OperationContextPlugin(Star):
         self.executor = IndependentExecution(
             StarTools.get_data_dir('astrbot_plugin_operation_context') / 'tasks', sanitize_text,
         )
-        self.outward_handlers = {
+        self.standalone_handlers = {
             'sandbox_agent': self.handle_agent,
             'post_publish': self.handle_publish,
             'post_delete': self.handle_delete,
             'post_submit': self.handle_submit,
+            'comment_publish': self.handle_comment,
+            'phone_events': self.handle_events,
         }
+        self.ledger = None
+        self.poller = None
+        self.phone_busy = False
         self.context.add_llm_tools(OperationTool(self))
+
+    async def initialize(self) -> None:
+        if not self.config.get('ledger_enabled'):
+            return
+        data_dir = StarTools.get_data_dir('astrbot_plugin_operation_context')
+        self.ledger = EventLedger(data_dir / 'ledger.db')
+        self.poller = NotificationPoller(
+            lambda: fetch_notifications(self.context),
+            lambda dump: record_dump(self.ledger, dump),
+            self.config.get('poll_interval_seconds', 600),
+        )
+        self.poller.start()
+        logger.info('Notification ledger polling every %s seconds', self.poller.interval)
+
+    async def terminate(self) -> None:
+        if self.poller is not None:
+            await self.poller.stop()
+            self.poller = None
+        if self.ledger is not None:
+            self.ledger.close()
+            self.ledger = None
 
     @filter.on_llm_request(priority=-10000)
     async def capture_authorized_tools(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         tools = req.func_tool
         event.set_extra(SNAPSHOT_KEY, [tool.name for tool in tools.tools if tool.active] if tools else [])
 
+    @filter.command('op_stop')
+    async def stop_operation(self, event: AstrMessageEvent):
+        if not event.is_admin():
+            yield event.plain_result('只有管理员可以停止手机任务。')
+            return
+        request_stop()
+        yield event.plain_result('已请求停止，执行器会在下一轮开始时收手，把已完成的部分交回来。')
+
     async def execute(self, run_context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None) -> str:
+        if self.phone_busy:
+            return json.dumps({
+                'status': 'busy', 'reason': 'another_phone_task_running',
+                'needs_parent': True, 'external_action_status': 'not_attempted',
+            })
+        self.phone_busy = True
+        try:
+            return await self._dispatch(
+                run_context, goal, actions, input_text, expect_text,
+                post_title, post_text, post_images, post_mention,
+            )
+        finally:
+            self.phone_busy = False
+
+    async def _dispatch(self, run_context, goal, actions, input_text, expect_text, post_title, post_text, post_images, post_mention) -> str:
         try:
             permitted, outward = resolve_actions(actions, self.config.get('allowed_capabilities', []))
             event = run_context.context.event
@@ -111,7 +168,7 @@ class OperationContextPlugin(Star):
                 time_budget=time_budget,
             )
             if outward is not None:
-                return await self.outward_handlers[outward](request)
+                return await self.standalone_handlers[outward](request)
             return await self.run_fixed(request)
         except Exception as exc:
             logger.warning('Restricted operation rejected or failed: %s', type(exc).__name__)
@@ -143,6 +200,16 @@ class OperationContextPlugin(Star):
         return PostSubmitter(
             execute_command,
             StarTools.get_data_dir('astrbot_plugin_operation_context') / 'post_submissions',
+        )
+
+    async def comment_submitter(self, request: TaskRequest) -> CommentSubmitter:
+        async def execute_command(command):
+            return json.loads(await request.shell.call(
+                request.run_context, command=command, background=False, timeout=120,
+            ))
+        return CommentSubmitter(
+            execute_command,
+            StarTools.get_data_dir('astrbot_plugin_operation_context') / 'comment_submissions',
         )
 
     async def handle_agent(self, request: TaskRequest) -> str:
@@ -194,6 +261,46 @@ class OperationContextPlugin(Star):
         validate_post(request.post_title, request.post_text)
         submitter = await self.submitter(request)
         return json.dumps(await submitter.submit(request.post_title, request.post_text), ensure_ascii=False)
+
+    async def handle_comment(self, request: TaskRequest) -> str:
+        if any(value is not None for value in (
+            request.expect_text, request.post_title, request.post_text, request.post_images,
+        )):
+            raise ValueError('unexpected_text_fields')
+        validate_comment(request.input_text)
+        preparation = await self.run_agent(
+            request, build_comment_goal(request.post_mention),
+            frozen_text=request.input_text, extra_rules=COMMENT_RULES,
+        )
+        result = {
+            'preparation': {
+                'status': preparation['status'], 'reason': preparation.get('reason'),
+                'summary': preparation['summary'], 'command_count': preparation['command_count'],
+                'raw_record': preparation['raw_record'],
+            },
+            'submit': {'status': 'skipped', 'reason': 'preparation_not_completed'},
+        }
+        if preparation['status'] == 'completed':
+            submitter = await self.comment_submitter(request)
+            result['submit'] = await submitter.submit(request.input_text)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def handle_events(self, request: TaskRequest) -> str:
+        if any(value is not None for value in (
+            request.input_text, request.expect_text, request.post_title,
+            request.post_text, request.post_mention,
+        )):
+            raise ValueError('unexpected_text_fields')
+        if self.ledger is None:
+            raise ValueError('ledger_disabled')
+        events = self.ledger.pending(limit=20)
+        actors = {
+            event['author']: self.ledger.actor(event['author'])
+            for event in events if event['author']
+        }
+        return json.dumps({
+            'events': events, 'actors': actors, 'counts': self.ledger.counts(),
+        }, ensure_ascii=False)
 
     async def run_fixed(self, request: TaskRequest) -> str:
         if request.post_title is not None or request.post_text is not None or request.post_mention not in (None, ''):

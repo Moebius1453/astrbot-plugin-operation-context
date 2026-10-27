@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from .execution import EXECUTION_PROTOCOL, IndependentExecution
+from ..app.execution import EXECUTION_PROTOCOL, IndependentExecution
 
 
 class Planner:

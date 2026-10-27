@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import contextlib
 import io
 
-from .adapter import (
+from ..app.adapter import (
     _APP_SCOPE_SCRIPT,
     CAPABILITIES,
     CapabilityBackend,
@@ -17,16 +17,17 @@ from .adapter import (
     validate_actions,
     validate_arguments,
 )
-from .phone_observation import PACKAGE, PhoneNode, PhoneObservation
-from .redaction import sanitize_text
+from ..app.phone_observation import PACKAGE, PhoneNode, PhoneObservation
+from ..app.redaction import sanitize_text
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_capability_set_is_narrow(self):
         self.assertEqual(CAPABILITIES, {
-            'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
+            'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_events',
             'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-            'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
+            'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish',
+            'sandbox_agent',
         })
 
     def test_action_arguments_are_closed_set(self):
@@ -62,15 +63,22 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolve_actions([], ['sandbox_agent']), (('sandbox_agent',), 'sandbox_agent'))
 
     def test_outward_capabilities_never_share_a_task(self):
-        configured = ['post_publish', 'phone_observe', 'sandbox_agent', 'phone_back']
+        configured = ['post_publish', 'phone_observe', 'sandbox_agent', 'phone_back', 'phone_events']
         self.assertEqual(
             resolve_actions(['post_publish'], configured), (('post_publish',), 'post_publish')
+        )
+        self.assertEqual(
+            resolve_actions(['phone_events'], configured), (('phone_events',), 'phone_events')
         )
         self.assertEqual(
             resolve_actions(['phone_back', 'phone_observe'], configured),
             (('phone_back', 'phone_observe'), None),
         )
-        for actions in (['post_publish', 'phone_observe'], ['phone_back', 'sandbox_agent']):
+        for actions in (
+            ['post_publish', 'phone_observe'],
+            ['phone_back', 'sandbox_agent'],
+            ['phone_events', 'phone_observe'],
+        ):
             with self.assertRaises(ValueError):
                 resolve_actions(actions, configured)
 
@@ -118,7 +126,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             await run('capture-command')
             return observation
 
-        with patch('operation_test.adapter.observe_phone', AsyncMock(side_effect=fake_observe)) as observe:
+        with patch('operation_test.app.adapter.observe_phone', AsyncMock(side_effect=fake_observe)) as observe:
             result = await CapabilityBackend(shell, None).execute('phone_observe')
         self.assertEqual(result['activity'], PACKAGE + '.MainActivity')
         self.assertEqual(result['nodes'], [{

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from .sandbox_agent import SandboxAgent
+from ..app.sandbox_agent import SandboxAgent
 
 
 class Response:
@@ -171,7 +171,8 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
             async def call(self, run_context, command, background=False, timeout=None):
                 return json.dumps({'exit_code': 0, 'stdout': 'x' * 800, 'stderr': ''})
 
-        commands = [f'echo step-{index}' for index in range(12)]
+        commands = [f'/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input tap {index} 1'
+                    for index in range(12)]
         planner = Planner([call(command) for command in commands] + [done('完')])
         result = await self.run_agent(planner, Verbose(), max_steps=20)
         self.assertEqual(result['status'], 'completed')
@@ -179,6 +180,45 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(texts), 12)
         self.assertIn('older result compacted', texts[0])
         self.assertNotIn('older result compacted', texts[-1])
+
+    async def test_repeating_one_command_three_times_gives_up(self):
+        planner = Planner([call('echo same') for _ in range(5)])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'repeated_command')
+        self.assertIn('three times', result['summary'])
+        self.assertEqual(result['command_count'], 3)
+
+    async def test_three_rounds_without_touching_the_phone_give_up(self):
+        planner = Planner([call('echo a'), call('echo b'), call('echo c'), call('echo d')])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'no_progress')
+        self.assertEqual(result['device_action_count'], 0)
+
+    async def test_three_failed_commands_give_up(self):
+        class Failing:
+            async def call(self, run_context, command, background=False, timeout=None):
+                return json.dumps({'exit_code': 1, 'stdout': '', 'stderr': 'boom'})
+
+        planner = Planner([call('echo a'), call('echo b'), call('echo c'), call('echo d')])
+        result = await self.run_agent(planner, Failing())
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'repeated_command_failure')
+
+    async def test_host_stop_request_ends_the_round_cleanly(self):
+        import time
+
+        from ..app import sandbox_agent
+
+        planner = Planner([call('echo a') for _ in range(5)])
+        original = sandbox_agent._stop_requested_at
+        sandbox_agent._stop_requested_at = time.monotonic() + 10_000
+        self.addCleanup(setattr, sandbox_agent, '_stop_requested_at', original)
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(result['reason'], 'parent_requested_stop')
+        self.assertIn('request of the host', result['summary'])
 
     async def test_time_budget_stops_before_the_next_round(self):
         planner = Planner([call('echo a')])

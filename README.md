@@ -57,9 +57,9 @@ adb 路径优先取 `/workspace/.local/adbdl/platform-tools/adb`，缺失时回�
 `allowed_capabilities` 可填：
 
 ```
-sandbox_status  phone_status  phone_app_scope  phone_observe
+sandbox_status  phone_status  phone_app_scope  phone_observe  phone_events
 phone_tap  phone_swipe  phone_back  phone_home  phone_start_app
-phone_input  post_submit  post_publish  post_delete  sandbox_agent
+phone_input  post_submit  post_publish  post_delete  comment_publish  sandbox_agent
 ```
 
 `post_submit`、`post_publish`、`post_delete`、`sandbox_agent` 必须单独使用。不填 `actions` 时自动走自由执行。
@@ -79,10 +79,10 @@ phone_input  post_submit  post_publish  post_delete  sandbox_agent
 
 | 类别 | 能力 |
 |---|---|
-| 查询 | `sandbox_status`、`phone_status`、`phone_app_scope` |
+| 查询 | `sandbox_status`、`phone_status`、`phone_app_scope`、`phone_events` |
 | 观察 | `phone_observe` |
 | 动作 | `phone_tap`、`phone_swipe`、`phone_back`、`phone_home`、`phone_start_app`、`phone_input` |
-| 发布 | `post_submit`、`post_publish`、`post_delete` |
+| 发布 | `post_submit`、`post_publish`、`post_delete`、`comment_publish` |
 | 自由执行 | `sandbox_agent` |
 
 能力按风险分三档。查询和观察不改状态；点击、滑动、输入、导航可撤销；发帖、删除和自由执行对外可见或能产生任意副作用，永远单独占用一次任务，不与其它能力混用。
@@ -97,6 +97,35 @@ phone_input  post_submit  post_publish  post_delete  sandbox_agent
 
 准备阶段未完成时不提交，返回 `preparation_not_completed`。`post_delete` 按精确标题删除主对话自己的帖子，标题存在 `/tmp/operation-target.txt`，多条匹配时拒绝猜测。
 
+### 评论：同样拆成准备与提交
+
+`comment_publish` 的正文走 `input_text`，可选昵称走 `post_mention`。
+
+执行器只负责把评论框填好：找到帖子、点开评论框、输入冻结原文、必要时用原生选人界面 @ 人，然后停下，不许点发送。
+
+宿主随后核对：评论框里的文字必须包含冻结原文，长度不能超出原文太多，页面必须是帖子详情；对上之后才点发送，再轮询列表确认评论出现。任何一步对不上就不发，返回 `unknown` 和原因。找不到唯一的发送控件时同样不发。宁可失败，不误发。
+
+### 目录结构
+
+```
+main.py              插件入口，AstrBot 要求放在根目录
+_conf_schema.json    配置面板
+metadata.yaml        插件元信息
+app/                 实现模块
+  adapter.py         能力白名单、参数校验、命令分发
+  execution.py       固定能力路径的执行循环
+  sandbox_agent.py   自由执行路径与执行协议
+  command_guard.py   自由执行路径的命令闸
+  phone_*.py         控件树、动作脚本、编辑器、发布
+  post_submit.py     发帖提交
+  comment_submit.py  评论提交
+  publish.py         发帖与评论的任务目标与规则
+  event_ledger.py    通知事件账本
+  notification_poll.py 定时读取通知
+  threat_detector.py 提示词注入检测（第三方，见文末致谢）
+tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
+```
+
 ### 两种执行模式
 
 固定能力适合目标明确的短操作：点哪里、输什么由主对话指定，副作用可预期。不填 `actions` 时走另一条。
@@ -108,6 +137,15 @@ phone_input  post_submit  post_publish  post_delete  sandbox_agent
 一次任务内执行器保留完整对话历史，记得自己跑过什么、看到过什么，不会每轮从零重算。早先的工具输出会被压缩成摘要，最近八条保留原文。
 
 两条路径共用同一个时间预算：AstrBot 给单次工具调用的 `tool_call_timeout` 减去十秒。预算将尽时执行器不再开新一轮，直接返回 `time_budget` 和已完成的部分，而不是被外层杀掉。
+
+执行器会自己认输，不再一路空转到步数耗尽。命中任一条件就停下并返回 `needs_parent` 和一份错误报告：
+相同命令执行第三次；连续三轮没有任何设备动作；连续三条命令非零退出。
+
+`status` 取值：`completed`、`needs_parent`、`time_budget`、`stopped`、`rejected`、`failed`。`reason` 写明具体原因，例如 `repeated_command`、`repeated_command_failure`、`no_progress`、`parent_requested_stop`。
+
+### 急停
+
+主人在对话里发 `/op_stop`，当前正在跑的手机任务会在下一轮开始时收手，返回 `stopped` 和已完成的部分。只有管理员能用。命令走的是命令阶段，不受会话串行锁影响，所以白正在等工具调用时也能生效。
 
 自由执行有一条宿主侧的命令闸，在命令进入 shell 之前逐条检查：只允许连指定设备、`am broadcast` 只允许 `ADB_INPUT_B64`、拒绝清数据与改系统设置、拒绝装包和起后台进程、拒绝删除 `/tmp` 以外的目录。被拒的命令不会执行，执行器收到原因后可以换方法。命令闸是黑名单，能拦住已知的破坏性命令，不能证明放行的命令安全。
 
@@ -160,6 +198,24 @@ phone_input  post_submit  post_publish  post_delete  sandbox_agent
 - 没有检测真人接管手机。手机目前只有执行器在用，这条规则等出现并发使用者再做。
 - 状态未知一律不重试，需要人工或主对话先观察确认。
 - 尚未完成干净环境部署与长期无人看护验收。
+
+### 事件账本
+
+`ledger_enabled` 打开后，插件每 `poll_interval_seconds` 秒读一次手机通知，把回复和提及记进 `data/plugin_data/astrbot_plugin_operation_context/ledger.db`。
+
+读取方式是 `dumpsys notification --noredact`，只读，不打开 App，不改变通知状态。只借用已有沙箱，不会为了轮询新建容器。
+
+记的是骨架：谁、哪篇帖、什么时候、哪条通知。评论正文不在通知里，所以账本里也没有。昵称超过十个字会被 App 截断成省略号，因此作者名不能当唯一身份；去重用 title、text、when 的指纹。
+
+账本只写不发，也不决定任何事。白可以主动调用 `phone_events` 读取待处理事件，返回的是谁、哪篇帖、什么时候，外加每个人被记录过几次。读取不改变事件状态，也不碰手机。
+
+`phone_events` 必须单独使用，不和其它能力混在一个任务里。
+
+### 任务互斥
+
+手机同一时间只接受一个插件任务。上一个任务还在跑时，新的调用立即返回 `busy` 和 `another_phone_task_running`，不会排队等待，也不会被外层的两分钟超时砍掉。
+
+这条是为了冻结文件：几张固定路径的临时文件是所有任务共用的，两个任务同时跑会互相覆盖，可能要发布的内容被换成了另一个任务的。
 
 ## 安全与隐私
 

@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from unittest.mock import AsyncMock
 
-from .phone_observation import PACKAGE, PhoneNode, PhoneObservation, _ViewDecoder, describe, foreground, normalize_label, observe_phone, parse_window_views, parse_xml
+from ..app.phone_observation import PACKAGE, PhoneNode, PhoneObservation, _ViewDecoder, describe, foreground, normalize_label, observe_phone, parse_window_views, parse_xml
 
 
 ACTIVITY = PACKAGE + '.module.bbs.post_edit.PostTabActivity'

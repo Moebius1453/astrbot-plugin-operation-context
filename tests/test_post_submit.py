@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .post_submit import PostSubmitter, submit_command, validate_post
+from ..app.post_submit import PostSubmitter, submit_command, validate_post
 
 
 class PostPayloadTests(unittest.TestCase):

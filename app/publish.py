@@ -17,6 +17,14 @@ THIS TASK IS A DELETION
 - Confirm the deletion dialog, then check the post is gone and report what you saw.
 '''
 
+COMMENT_RULES = '''
+THIS TASK IS PREPARATION ONLY
+- Open the comment box on the post the parent named and type the frozen text into it.
+- Do not tap 发送 or any other send control. The host performs the final send.
+- The text comes from /tmp/operation-frozen.txt. Use it byte for byte.
+- Report in your final sentence what is now in the comment box.
+'''
+
 PATH_PATTERN = re.compile(r'^/workspace/[A-Za-z0-9._-]+\.(png|jpg|jpeg)$')
 
 IMAGES_ENABLED = False
@@ -46,6 +54,20 @@ def validate_publish(title, text, images, mention):
             raise ValueError('invalid_post_mention')
         if any(ord(character) < 32 for character in mention):
             raise ValueError('invalid_post_mention')
+
+
+def build_comment_goal(mention):
+    parts = [
+        'Open the comment box on the post the parent named and type the frozen text into it, then stop.',
+        'The text is in /tmp/operation-frozen.txt. Type it exactly; do not translate, shorten, add or remove punctuation.',
+    ]
+    if mention:
+        parts.append(
+            f'Mention {mention} at the start: type a single @ and use the native mention picker, '
+            'not a plain @text string.'
+        )
+    parts.append('Do not send. When the comment box holds the finished comment, stop and describe what you see.')
+    return ' '.join(parts)
 
 
 def build_goal(images, mention):

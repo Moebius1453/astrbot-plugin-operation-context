@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
-from .publication import Publication, PublicationChain
+from ..app.publication import Publication, PublicationChain
 
 
 class PublicationTests(unittest.IsolatedAsyncioTestCase):

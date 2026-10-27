@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import AsyncMock
 
-from .phone_publication import PhonePostDriver
-from .publication import Publication
+from ..app.phone_publication import PhonePostDriver
+from ..app.publication import Publication
 
 
 class PostDriverTests(unittest.IsolatedAsyncioTestCase):

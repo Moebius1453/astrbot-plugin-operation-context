@@ -53,9 +53,9 @@ def screen_observation(description: dict) -> dict:
 TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
-    'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
+    'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe', 'phone_events',
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
+    'phone_input', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'sandbox_agent',
 })
 ACTION_CAPABILITIES = frozenset({
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_input',
@@ -64,10 +64,16 @@ ACTION_CAPABILITIES = frozenset({
 # tier 3 can be seen by someone outside this conversation. Tier 3 never shares a task.
 CAPABILITY_TIERS = {
     'sandbox_status': 1, 'phone_status': 1, 'phone_app_scope': 1, 'phone_observe': 1,
+    'phone_events': 1,
     'phone_tap': 2, 'phone_swipe': 2, 'phone_back': 2, 'phone_home': 2,
     'phone_start_app': 2, 'phone_input': 2,
-    'post_submit': 3, 'post_publish': 3, 'post_delete': 3, 'sandbox_agent': 3,
+    'post_submit': 3, 'post_publish': 3, 'post_delete': 3, 'comment_publish': 3,
+    'sandbox_agent': 3,
 }
+# Capabilities that never share a task, whether or not they act outwardly.
+STANDALONE_CAPABILITIES = frozenset({
+    'phone_events', 'post_submit', 'post_publish', 'post_delete', 'comment_publish', 'sandbox_agent',
+})
 SHELL_NAME = 'astrbot_execute_shell'
 
 _SANDBOX_SCRIPT = '''import json, os, shutil
@@ -117,19 +123,19 @@ def validate_actions(actions, configured):
 
 
 def resolve_actions(actions, configured):
-    """Return the permitted capabilities and the tier-3 one, if any.
+    """Return the permitted capabilities and the one that must run alone.
 
-    Omitting actions means free execution. A capability that can be seen from
-    outside this conversation is never combined with anything else, because the
-    host can no longer say which part produced the outward effect.
+    A capability that can be seen from outside this conversation, or that
+    answers from a different source than the phone driver, never shares a task:
+    the host could no longer say which part produced the result.
     """
     if actions is None or actions == []:
         actions = ['sandbox_agent']
     permitted = validate_actions(actions, configured)
-    outward = [name for name in permitted if CAPABILITY_TIERS[name] == 3]
-    if outward and len(permitted) > 1:
-        raise ValueError('outward_action_must_be_alone')
-    return permitted, outward[0] if outward else None
+    alone = [name for name in permitted if name in STANDALONE_CAPABILITIES]
+    if alone and len(permitted) > 1:
+        raise ValueError('standalone_capability_must_be_alone')
+    return permitted, alone[0] if alone else None
 
 
 ACTION_SCHEMAS = {

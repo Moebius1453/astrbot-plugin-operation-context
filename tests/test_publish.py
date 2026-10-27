@@ -1,6 +1,6 @@
 import unittest
 
-from .publish import DELETE_RULES, PREPARE_RULES, build_goal, validate_publish
+from ..app.publish import DELETE_RULES, PREPARE_RULES, build_goal, validate_publish
 
 
 class PublishRequestTests(unittest.TestCase):

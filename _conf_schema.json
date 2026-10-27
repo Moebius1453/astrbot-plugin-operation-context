@@ -1,6 +1,6 @@
 {
   "allowed_capabilities": {
-    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_input、post_submit、post_publish、post_delete、sandbox_agent。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行；sandbox_agent必须单独使用，给执行器沙箱内shell自由操作，对外文字限制为input_text原文；post_submit必须单独使用，提交前落unknown，提交后读回，未知不重试。不提供QQ，不提供截图和坐标点击。",
+    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_events、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_input、post_submit、post_publish、post_delete、comment_publish、sandbox_agent。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行；sandbox_agent必须单独使用，给执行器沙箱内shell自由操作，对外文字限制为input_text原文；post_submit必须单独使用，提交前落unknown，提交后读回，未知不重试；comment_publish先由执行器填评论框，宿主核对后才发送；phone_events只读事件账本，不碰手机。不提供QQ，不提供截图和坐标点击。",
     "type": "list",
     "default": []
   },
@@ -18,5 +18,15 @@
     "description": "子代理使用的模型ID，留空则用当前聊天模型。子代理只通过控件树和 shell 感知，不使用图片",
     "type": "string",
     "default": ""
+  },
+  "ledger_enabled": {
+    "description": "是否定期读取手机通知并记入事件账本。只读，不打开App，不改变通知状态",
+    "type": "bool",
+    "default": false
+  },
+  "poll_interval_seconds": {
+    "description": "通知轮询间隔秒数，最少60",
+    "type": "int",
+    "default": 600
   }
 }

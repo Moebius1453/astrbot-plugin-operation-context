@@ -1,6 +1,6 @@
 import unittest
 
-from .command_guard import count_device_actions, guard
+from ..app.command_guard import count_device_actions, guard
 
 
 ADB = '/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 '
