@@ -7,7 +7,7 @@ from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 
 TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
-CAPABILITIES = frozenset({'sandbox_status', 'phone_status'})
+CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
 SHELL_NAME = 'astrbot_execute_shell'
 
 _SANDBOX_SCRIPT = '''import json, os, shutil
@@ -25,7 +25,20 @@ else:
     state = r.stdout.strip()
     print(json.dumps({'state': state if state in ('device', 'offline', 'unknown') else 'unavailable', 'exit_code': r.returncode}))
 '''
+_APP_SCOPE_SCRIPT = '''import json, os, re, subprocess
+adb = '/workspace/.local/adbdl/platform-tools/adb'
+if not os.path.isfile(adb):
+    adb = '/usr/bin/adb'
+if not os.path.isfile(adb):
+    raise RuntimeError('adb_client_missing')
+r = subprocess.run([adb, '-s', '172.22.0.2:5555', 'shell', 'dumpsys', 'activity', 'activities'], capture_output=True, text=True, timeout=10)
+if r.returncode != 0:
+    raise RuntimeError('foreground_query_failed')
+packages = re.findall(r'mResumedActivity:.*?\\s([A-Za-z0-9_.]+)/', r.stdout)
+print(json.dumps({'scope': 'allowed_app' if packages and set(packages) == {'com.max.xiaoheihe'} else 'blocked_or_unknown'}))
+'''
 COMMANDS = {
+    'phone_app_scope': 'python3 -I -c ' + shlex.quote(_APP_SCOPE_SCRIPT),
     'sandbox_status': 'python3 -I -c ' + shlex.quote(_SANDBOX_SCRIPT),
     'phone_status': 'python3 -I -c ' + shlex.quote(_PHONE_SCRIPT),
 }
@@ -86,6 +99,10 @@ class CapabilityBackend:
             ):
                 raise ValueError('invalid_sandbox_status')
             return {key: data[key] for key in ('workspace_exists', 'free_bytes', 'total_bytes')}
+        if action == 'phone_app_scope':
+            if data.get('scope') not in {'allowed_app', 'blocked_or_unknown'}:
+                raise ValueError('invalid_app_scope')
+            return {'scope': data['scope'], 'content_read': False}
         if data.get('state') not in {'device', 'offline', 'unknown', 'unavailable', 'client_missing'}:
             raise ValueError('invalid_phone_state')
         return {'state': data['state']}

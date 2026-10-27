@@ -15,12 +15,12 @@ class OperationTool(FunctionTool):
     def __init__(self, owner):
         super().__init__(
             name=TOOL_NAME,
-            description='无人格的受限状态查询接口。仅支持沙箱容量和手机连接状态；不操作QQ、不生成对外回应、不执行任意命令或发送。其他任务返回上级处理。',
+            description='无人格的受限状态查询接口。支持沙箱容量、手机连接状态及允许应用范围检查；不操作QQ、不生成对外回应、不执行任意命令或发送。其他任务返回上级处理。',
             parameters={
                 'type': 'object',
                 'properties': {
                     'goal': {'type': 'string', 'maxLength': 4000},
-                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status']}, 'minItems': 1, 'maxItems': 2, 'uniqueItems': True},
+                    'actions': {'type': 'array', 'items': {'type': 'string', 'enum': ['sandbox_status', 'phone_status', 'phone_app_scope']}, 'minItems': 1, 'maxItems': 2, 'uniqueItems': True},
                 },
                 'required': ['goal', 'actions'], 'additionalProperties': False,
             },
