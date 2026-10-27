@@ -1,7 +1,61 @@
+import io
+import json
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from .phone_actions import action_command, parse_receipt
+from .phone_actions import _TAP_SCRIPT, action_command, parse_receipt
 from .phone_observation import PACKAGE
+
+
+XML = (
+    '<hierarchy>'
+    '<node package="com.max.xiaoheihe" class="android.widget.RelativeLayout" resource-id="" text="" '
+    'bounds="[0,873][720,965]" clickable="true" enabled="true">'
+    '<node package="com.max.xiaoheihe" class="android.widget.TextView" '
+    'resource-id="com.max.xiaoheihe:id/tv_desc" text="内容" bounds="[332,899][388,937]" '
+    'clickable="false" enabled="true"/>'
+    '</node></hierarchy>'
+)
+FOCUS = ' mCurrentFocus=Window{1 u0 com.max.xiaoheihe/.MainActivity}'
+
+
+def fake_run(calls):
+    def run(args, **kwargs):
+        calls.append(args)
+        command = args[3:]
+        if command[:1] == ['shell'] and command[1:2] == ['dumpsys']:
+            return SimpleNamespace(returncode=0, stdout=FOCUS, stderr='')
+        if command[:1] == ['shell'] and command[1:2] == ['uiautomator']:
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if command[:1] == ['shell'] and command[1:2] == ['cat']:
+            return SimpleNamespace(returncode=0, stdout=XML, stderr='')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    return run
+
+
+class TapScriptTests(unittest.TestCase):
+    def tap(self, target, match):
+        payload = {'attr': 'resource-id' if match == 'id' else 'text', 'target': target}
+        script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps(payload, ensure_ascii=False)), 1)
+        calls = []
+        output = io.StringIO()
+        with patch('subprocess.run', fake_run(calls)), redirect_stdout(output):
+            exec(script, {})
+        return json.loads(output.getvalue()), calls
+
+    def test_tap_uses_nearest_clickable_ancestor(self):
+        result, calls = self.tap('内容', 'text')
+        self.assertEqual(result['bounds'], [0, 873, 720, 965])
+        tap_calls = [call for call in calls if call[3:5] == ['shell', 'input']]
+        self.assertEqual(len(tap_calls), 1)
+        self.assertEqual(tap_calls[0][-2:], ['360', '919'])
+
+    def test_tap_reports_not_interactive_without_clickable_ancestor(self):
+        script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps({'attr': 'resource-id', 'target': 'missing'})), 1)
+        with patch('subprocess.run', fake_run([])), self.assertRaisesRegex(RuntimeError, 'missing_or_ambiguous_target'):
+            exec(script, {})
 
 
 class ActionCommandTests(unittest.TestCase):

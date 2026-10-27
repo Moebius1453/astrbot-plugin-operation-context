@@ -122,7 +122,7 @@ class IndependentExecution:
                             reason = 'stalled_repeat'
                             stalled = True
                             break
-                        hooks.append('capability_start', capability=name)
+                        hooks.append('capability_start', capability=name, arguments=args)
                         observation = await asyncio.wait_for(backend.execute(name, args), timeout=tool_call_timeout)
                         safe = hooks._safe(observation)
                         hooks.append('capability_end', capability=name, observation=safe)

@@ -33,10 +33,13 @@ def run(args,timeout=12):
     return r.stdout
 ''' + _FOCUS_GUARD + _DUMP_GUARD + r'''focus()
 root=controls()
+parents={child:parent for parent in root.iter() for child in parent}
 hits=[node for node in root.iter('node') if node.get(payload['attr'])==payload['target']]
 if len(hits)!=1: raise RuntimeError('missing_or_ambiguous_target')
 node=hits[0]
-if node.get('clickable')!='true' or node.get('enabled')!='true': raise RuntimeError('target_not_interactive')
+while node is not None and node.tag=='node' and node.get('clickable')!='true':
+    node=parents.get(node)
+if node is None or node.tag!='node' or node.get('clickable')!='true' or node.get('enabled')!='true': raise RuntimeError('target_not_interactive')
 match=re.fullmatch(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]',node.get('bounds',''))
 if not match: raise RuntimeError('invalid_target_bounds')
 x1,y1,x2,y2=map(int,match.groups())
