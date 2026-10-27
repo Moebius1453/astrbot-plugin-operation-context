@@ -140,6 +140,26 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_task(planner, actions=('phone_observe',), frozen={'expect_text': '不存在'})
         self.assertIs(result['expect_text_found'], False)
 
+    async def test_query_stops_after_one_round(self):
+        planner = Planner([response(['phone_status'])] * 5)
+        result = await self.run_task(planner, actions=('phone_status',))
+        self.assertEqual(result['reason'], 'queries_complete')
+        self.assertEqual(len(self.backend.calls), 1)
+        self.assertEqual(result['rounds'], 1)
+
+    async def test_identical_non_repeatable_call_stalls(self):
+        planner = Planner([response(['phone_screenshot'])] * 5)
+        result = await self.run_task(planner, actions=('phone_screenshot',))
+        self.assertEqual(result['reason'], 'stalled_repeat')
+        self.assertEqual(len(self.backend.calls), 1)
+        self.assertEqual(result['action_count'], 1)
+
+    async def test_observe_remains_repeatable(self):
+        planner = Planner([response(['phone_observe'])] * 5)
+        result = await self.run_task(planner, actions=('phone_observe',), max_steps=3)
+        self.assertEqual(result['reason'], 'step_limit')
+        self.assertEqual(len(self.backend.calls), 3)
+
     async def test_batch_validated_before_any_action(self):
         result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))
         self.assertEqual(result['status'], 'rejected')
