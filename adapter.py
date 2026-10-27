@@ -1,13 +1,48 @@
 import json
+import re
 import shlex
 
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 
+from .phone_actions import action_command, parse_receipt
+from .phone_observation import describe, observe_phone
+from .threat_detector import PromptThreatDetector
+
+
+TAINT_SCORE = 5
+_DETECTOR = PromptThreatDetector()
+
+
+def screen_observation(description: dict) -> dict:
+    texts = [
+        node['text'] for node in description['nodes']
+        if isinstance(node.get('text'), str) and node['text']
+    ]
+    if not texts:
+        return description
+    report = _DETECTOR.analyze('\n'.join(texts))
+    if report['score'] < TAINT_SCORE:
+        return description
+    for node in description['nodes']:
+        if isinstance(node.get('text'), str) and node['text']:
+            node['text'] = '[已屏蔽]'
+    description['text_available'] = False
+    description['tainted'] = report['severity']
+    return description
+
 
 TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
-CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
+CAPABILITIES = frozenset({
+    'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
+    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+    'phone_screenshot', 'phone_input',
+})
+ACTION_CAPABILITIES = frozenset({
+    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+    'phone_screenshot', 'phone_input',
+})
 SHELL_NAME = 'astrbot_execute_shell'
 
 _SANDBOX_SCRIPT = '''import json, os, shutil
@@ -45,8 +80,8 @@ COMMANDS = {
 
 
 def validate_actions(actions, configured):
-    if not isinstance(actions, list) or not actions or len(actions) > 2:
-        raise ValueError('actions_must_be_nonempty_list_up_to_two')
+    if not isinstance(actions, list) or not actions or len(actions) > 4:
+        raise ValueError('actions_must_be_nonempty_list_up_to_four')
     if not isinstance(configured, list) or not all(isinstance(x, str) for x in configured):
         raise ValueError('invalid_capability_configuration')
     if not all(isinstance(x, str) and x in CAPABILITIES and x in configured for x in actions):
@@ -54,6 +89,65 @@ def validate_actions(actions, configured):
     if len(set(actions)) != len(actions):
         raise ValueError('duplicate_action')
     return tuple(actions)
+
+
+ACTION_SCHEMAS = {
+    'phone_tap': {
+        'type': 'object',
+        'properties': {
+            'target': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+            'match': {'type': 'string', 'enum': ['id', 'text']},
+        },
+        'required': ['target'], 'additionalProperties': False,
+    },
+    'phone_input': {
+        'type': 'object',
+        'properties': {'target': {'type': 'string', 'minLength': 1, 'maxLength': 200}},
+        'required': ['target'], 'additionalProperties': False,
+    },
+    'phone_back': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+    'phone_home': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+    'phone_start_app': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+    'phone_screenshot': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+    'phone_swipe': {
+        'type': 'object',
+        'properties': {
+            'target': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+            'direction': {'type': 'string', 'enum': ['up', 'down', 'left', 'right']},
+        },
+        'required': ['target', 'direction'], 'additionalProperties': False,
+    },
+}
+
+
+def validate_arguments(action, arguments, frozen):
+    schema = ACTION_SCHEMAS.get(action)
+    if schema is None:
+        if arguments != {}:
+            raise ValueError('arguments_not_allowed')
+        return {}
+    if type(arguments) is not dict:
+        raise ValueError('invalid_arguments')
+    if set(arguments) - set(schema['properties']):
+        raise ValueError('unknown_argument')
+    if set(schema.get('required', ())) - set(arguments):
+        raise ValueError('missing_argument')
+    for value in arguments.values():
+        if not isinstance(value, str) or not value or len(value) > 200:
+            raise ValueError('invalid_argument_value')
+        if any(ord(character) < 32 for character in value):
+            raise ValueError('invalid_argument_value')
+    if arguments.get('match', 'id') not in ('id', 'text'):
+        raise ValueError('invalid_match')
+    if 'direction' in arguments and arguments['direction'] not in ('up', 'down', 'left', 'right'):
+        raise ValueError('invalid_direction')
+    if 'target' in arguments and arguments.get('match', 'id') == 'id' and not re.fullmatch(r'[A-Za-z0-9_.]+', arguments['target']):
+        raise ValueError('invalid_resource_id')
+    if action == 'phone_input':
+        text = frozen.get('text') if isinstance(frozen, dict) else None
+        if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+            raise ValueError('frozen_text_required')
+    return arguments
 
 
 def build_backend(run_context, context, authorized):
@@ -74,18 +168,41 @@ def build_backend(run_context, context, authorized):
 
 
 class CapabilityBackend:
-    def __init__(self, shell, run_context):
+    def __init__(self, shell, run_context, frozen=None):
         self.shell = shell
         self.run_context = run_context
+        self.frozen = frozen or {}
 
-    async def execute(self, action):
-        if action not in CAPABILITIES:
-            raise ValueError('unsupported_capability')
+    async def _envelope(self, command, timeout):
         raw = await self.shell.call(
-            self.run_context, command=COMMANDS[action], background=False, timeout=20,
+            self.run_context, command=command, background=False, timeout=timeout,
         )
         envelope = json.loads(raw)
-        if not isinstance(envelope, dict) or envelope.get('exit_code') != 0:
+        if not isinstance(envelope, dict):
+            raise ValueError('invalid_shell_envelope')
+        return envelope
+
+    async def execute(self, action, arguments=None):
+        if action not in CAPABILITIES:
+            raise ValueError('unsupported_capability')
+        arguments = validate_arguments(action, {} if arguments is None else arguments, self.frozen)
+        if action == 'phone_observe':
+            async def run(command):
+                return await self._envelope(command, 60)
+            return screen_observation(describe(await observe_phone(run)))
+        if action in ACTION_CAPABILITIES:
+            envelope = await self._envelope(action_command(action, arguments, self.frozen), 45)
+            if envelope.get('exit_code') != 0:
+                raise ValueError('action_failed_state_unknown')
+            output = envelope.get('stdout')
+            if not isinstance(output, str) or len(output) > 4096:
+                raise ValueError('invalid_action_receipt')
+            data = json.loads(output)
+            if not isinstance(data, dict):
+                raise ValueError('invalid_action_receipt')
+            return parse_receipt(action, data)
+        envelope = await self._envelope(COMMANDS[action], 20)
+        if envelope.get('exit_code') != 0:
             raise ValueError('backend_command_failed')
         output = envelope.get('stdout')
         if not isinstance(output, str) or len(output) > 4096:
@@ -110,7 +227,11 @@ class CapabilityBackend:
 
 def planner_tools(actions):
     return ToolSet([
-        FunctionTool(name=action, description='Request the authorized status observation.', parameters={
-            'type': 'object', 'properties': {}, 'additionalProperties': False,
-        }) for action in actions
+        FunctionTool(
+            name=action,
+            description='Request the authorized capability with the supplied parameters only.',
+            parameters=ACTION_SCHEMAS.get(action, {
+                'type': 'object', 'properties': {}, 'additionalProperties': False,
+            }),
+        ) for action in actions
     ])

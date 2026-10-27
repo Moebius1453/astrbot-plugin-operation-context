@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from unittest.mock import AsyncMock
 
-from .phone_observation import PACKAGE, PhoneObservation, _ViewDecoder, foreground, observe_phone, parse_window_views, parse_xml
+from .phone_observation import PACKAGE, PhoneNode, PhoneObservation, _ViewDecoder, describe, foreground, observe_phone, parse_window_views, parse_xml
 
 
 ACTIVITY = PACKAGE + '.module.bbs.post_edit.PostTabActivity'
@@ -106,3 +106,27 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonzero_capture_cannot_be_success(self):
         with self.assertRaises(ValueError):
             await observe_phone(AsyncMock(return_value={'exit_code': 1, 'stdout': '{}'}))
+
+    def test_describe_keeps_text_only_for_xml_source(self):
+        xml_result = describe(PhoneObservation(ACTIVITY, 'uiautomator', parse_xml(XML)))
+        self.assertTrue(xml_result['text_available'])
+        self.assertEqual(xml_result['nodes'][0]['text'], '')
+        self.assertEqual(xml_result['nodes'][0]['id'], 'et_content')
+        structural = describe(PhoneObservation(ACTIVITY, 'window_views', parse_window_views(view_archive(), ACTIVITY)))
+        self.assertFalse(structural['text_available'])
+        self.assertIsNone(structural['nodes'][0]['text'])
+        self.assertEqual(structural['nodes'][0]['bounds'], [32, 245, 688, 424])
+
+    def test_describe_drops_decorative_nodes_and_reports_truncation(self):
+        nodes = (
+            PhoneNode(PACKAGE + ':id/et_title', 'android.widget.EditText', 't', (0, 0, 10, 10), True, True),
+            PhoneNode('', 'android.view.View', '', (0, 0, 720, 1184), False, True),
+            PhoneNode('', 'android.widget.Button', '', (0, 0, 10, 10), True, True),
+        )
+        result = describe(PhoneObservation(ACTIVITY, 'uiautomator', nodes))
+        self.assertEqual(result['node_count'], 3)
+        self.assertEqual(result['returned_count'], 2)
+        self.assertFalse(result['truncated'])
+        limited = describe(PhoneObservation(ACTIVITY, 'uiautomator', nodes), limit=1)
+        self.assertEqual(limited['returned_count'], 1)
+        self.assertTrue(limited['truncated'])

@@ -15,7 +15,10 @@ class Planner:
 
     async def llm_generate(self, **kwargs):
         self.requests.append(kwargs)
-        return next(self.responses)
+        try:
+            return next(self.responses)
+        except StopIteration:
+            return response([])
 
 
 def response(names=(), args=None, text=''):
@@ -26,8 +29,11 @@ class Backend:
     def __init__(self):
         self.calls = []
 
-    async def execute(self, name):
-        self.calls.append(name)
+    async def execute(self, name, args=None):
+        self.calls.append((name, args))
+        if name == 'phone_observe':
+            return {'activity': 'a', 'source': 'uiautomator', 'text_available': True, 'node_count': 2,
+                    'truncated': False, 'nodes': [{'id': 'x', 'text': '目标文字'}]}
         return {'state': 'device'}
 
 
@@ -38,14 +44,14 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.executor = IndependentExecution(Path(self.directory.name), lambda text: text)
         self.backend = Backend()
 
-    async def run_task(self, planner, **kwargs):
-        return await self.executor.run(context=planner, provider_id='fake', goal='status', actions=('phone_status',), backend=self.backend, **kwargs)
+    async def run_task(self, planner, actions=('phone_status',), **kwargs):
+        return await self.executor.run(context=planner, provider_id='fake', goal='status', actions=actions, backend=self.backend, **kwargs)
 
     async def test_observation_without_final_text(self):
         planner = Planner([response(['phone_status'])])
         result = await self.run_task(planner)
         self.assertEqual(result['status'], 'observations_returned')
-        self.assertEqual(self.backend.calls, ['phone_status'])
+        self.assertEqual(self.backend.calls, [('phone_status', {})])
         request = planner.requests[0]
         self.assertEqual(request['system_prompt'], EXECUTION_PROTOCOL)
         self.assertEqual(request['contexts'], [])
@@ -55,7 +61,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['task_goal_verified'])
 
     async def test_qq_shell_and_publish_are_rejected(self):
-        for name in ['send_message_to_user', 'astrbot_execute_shell', 'phone_tap', 'publish', 'future_task']:
+        for name in ['send_message_to_user', 'astrbot_execute_shell', 'phone_delete', 'publish', 'future_task']:
             self.backend.calls.clear()
             result = await self.run_task(Planner([response([name])]))
             self.assertEqual(result['status'], 'rejected')
@@ -66,6 +72,73 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             result = await self.run_task(Planner([response(['phone_status'], [args])]))
             self.assertEqual(result['status'], 'rejected')
         self.assertEqual(self.backend.calls, [])
+
+    async def test_action_arguments_are_validated_before_backend(self):
+        for args in [
+            {'command': 'adb shell input text hi'},
+            {'target': '../../etc/passwd'},
+            {'target': 'et_editor', 'extra': 'x'},
+            {},
+        ]:
+            result = await self.run_task(Planner([response(['phone_tap'], [args])]), actions=('phone_tap',))
+            self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(self.backend.calls, [])
+
+    async def test_action_target_is_passed_to_backend(self):
+        result = await self.run_task(
+            Planner([response(['phone_tap'], [{'target': 'et_editor'}])]), actions=('phone_tap',),
+        )
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual(self.backend.calls, [('phone_tap', {'target': 'et_editor'})])
+
+    async def test_input_requires_host_frozen_text(self):
+        result = await self.run_task(
+            Planner([response(['phone_input'], [{'target': 'et_editor'}])]), actions=('phone_input',),
+        )
+        self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(self.backend.calls, [])
+        planner = Planner([response(['phone_input'], [{'target': 'et_editor'}])])
+        result = await self.run_task(planner, actions=('phone_input',), frozen={'text': '原文'})
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual(planner.requests[0]['prompt'].count('frozen by host'), 1)
+
+    async def test_actions_can_repeat_and_result_stays_compact(self):
+        planner = Planner([
+            response(['phone_observe']),
+            response(['phone_tap'], [{'target': 'et_editor'}]),
+            response(['phone_observe']),
+            response([]),
+        ])
+        result = await self.run_task(planner, actions=('phone_observe', 'phone_tap'), max_steps=6)
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual([call[0] for call in self.backend.calls], ['phone_observe', 'phone_tap', 'phone_observe'])
+        self.assertNotIn('observations', result)
+        self.assertEqual(result['action_count'], 1)
+        self.assertEqual(result['actions_taken'], [{'capability': 'phone_tap', 'result': {'state': 'device'}}])
+        self.assertEqual(result['final']['capability'], 'phone_observe')
+        self.assertEqual(result['external_action_status'], 'attempted')
+
+    async def test_step_limit_keeps_partial_observations(self):
+        planner = Planner([response(['phone_observe'])] * 3)
+        result = await self.run_task(planner, actions=('phone_observe',), max_steps=2)
+        self.assertEqual(result['status'], 'observations_returned')
+        self.assertEqual(result['reason'], 'step_limit')
+        self.assertEqual(len(self.backend.calls), 2)
+
+    async def test_result_never_contains_control_tree(self):
+        planner = Planner([response(['phone_observe'])])
+        result = await self.run_task(planner, actions=('phone_observe',))
+        self.assertNotIn('nodes', result['final'])
+        self.assertEqual(result['final']['node_count'], 2)
+        self.assertNotIn('目标文字', json.dumps(result, ensure_ascii=False))
+
+    async def test_expect_text_returns_boolean_only(self):
+        planner = Planner([response(['phone_observe'])])
+        result = await self.run_task(planner, actions=('phone_observe',), frozen={'expect_text': '目标'})
+        self.assertIs(result['expect_text_found'], True)
+        planner = Planner([response(['phone_observe'])])
+        result = await self.run_task(planner, actions=('phone_observe',), frozen={'expect_text': '不存在'})
+        self.assertIs(result['expect_text_found'], False)
 
     async def test_batch_validated_before_any_action(self):
         result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))
@@ -79,8 +152,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.calls, [])
 
     async def test_failure_not_retried(self):
-        async def fail(name):
-            self.backend.calls.append(name)
+        async def fail(name, args=None):
+            self.backend.calls.append((name, args))
             raise TimeoutError()
         self.backend.execute = fail
         result = await self.run_task(Planner([response(['phone_status'])]))
@@ -88,7 +161,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.backend.calls), 1)
 
     async def test_cancel_propagates_and_records(self):
-        async def cancel(name):
+        async def cancel(name, args=None):
             raise asyncio.CancelledError()
         self.backend.execute = cancel
         with self.assertRaises(asyncio.CancelledError):

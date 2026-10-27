@@ -1,17 +1,17 @@
 {
   "allowed_capabilities": {
-    "description": "允许的受限能力：sandbox_status、phone_status。默认空，不继承旧allowed_tools。仅查询容量和连接状态，不提供QQ、任意命令、手机交互或发布。",
+    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_screenshot、phone_input。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行一次，文字必须由主对话原文提供。不提供QQ、任意命令、发布或评论。",
     "type": "list",
     "default": []
   },
   "max_steps": {
-    "description": "执行规划循环上限，1至8",
+    "description": "执行规划循环上限，1至24。每轮可请求多个动作，动作可在不同轮重复",
     "type": "int",
-    "default": 4
+    "default": 10
   },
   "tool_call_timeout": {
     "description": "单个受限能力超时秒数，1至60",
     "type": "int",
-    "default": 30
+    "default": 60
   }
 }

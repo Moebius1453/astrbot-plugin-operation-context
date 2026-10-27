@@ -220,6 +220,36 @@ print(json.dumps({'before':before,'after':after,'source':source,'content':base64
 CAPTURE_COMMAND = 'python3 -I -c ' + shlex.quote(_CAPTURE_SCRIPT)
 
 
+def describe(observation: PhoneObservation, limit: int = 120) -> dict:
+    if type(limit) is not int or limit < 1:
+        raise ValueError('invalid_node_limit')
+    text_available = observation.source == 'uiautomator'
+    meaningful = [
+        node for node in observation.nodes
+        if node.text or node.identifier or node.clickable
+    ]
+    prefix = PACKAGE + ':id/'
+    return {
+        'activity': observation.activity,
+        'source': observation.source,
+        'text_available': text_available,
+        'node_count': len(observation.nodes),
+        'returned_count': min(len(meaningful), limit),
+        'truncated': len(meaningful) > limit,
+        'nodes': [
+            {
+                'id': node.identifier.removeprefix(prefix),
+                'class': node.class_name,
+                'text': node.text if text_available else None,
+                'bounds': list(node.bounds),
+                'clickable': node.clickable,
+                'enabled': node.enabled,
+            }
+            for node in meaningful[:limit]
+        ],
+    }
+
+
 async def observe_phone(execute_command) -> PhoneObservation:
     import base64
 
