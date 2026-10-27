@@ -94,13 +94,17 @@ class OperationContextPlugin(Star):
                 if not isinstance(expect_text, str) or not expect_text.strip() or len(expect_text) > 200:
                     raise ValueError('invalid_expect_text')
                 frozen['expect_text'] = expect_text
-            provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
+            executor_provider = self.config.get('executor_provider')
+            if isinstance(executor_provider, str) and executor_provider.strip():
+                provider_id = executor_provider.strip()
+            else:
+                provider_id = await self.context.get_current_chat_provider_id(event.unified_msg_origin)
             result = await self.executor.run(
                 context=self.context, provider_id=provider_id, goal=goal,
                 actions=permitted, backend=CapabilityBackend(shell, run_context, frozen),
                 max_steps=self.config.get('max_steps', 4),
                 tool_call_timeout=self.config.get('tool_call_timeout', 30),
-                frozen=frozen,
+                frozen=frozen, vision=True,
             )
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:

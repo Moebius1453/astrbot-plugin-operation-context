@@ -107,6 +107,15 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await observe_phone(AsyncMock(return_value={'exit_code': 1, 'stdout': '{}'}))
 
+    def test_content_desc_is_preserved_and_described(self):
+        xml = ('<hierarchy><node package="com.max.xiaoheihe" class="android.view.View" '
+               'content-desc="搜索" bounds="[0,0][10,10]" clickable="true" enabled="true"/></hierarchy>')
+        node = parse_xml(xml)[0]
+        self.assertEqual(node.desc, '搜索')
+        self.assertEqual(node.text, '')
+        described = describe(PhoneObservation(ACTIVITY, 'uiautomator', (node,)))
+        self.assertEqual(described['nodes'][0]['desc'], '搜索')
+
     def test_describe_keeps_text_only_for_xml_source(self):
         xml_result = describe(PhoneObservation(ACTIVITY, 'uiautomator', parse_xml(XML)))
         self.assertTrue(xml_result['text_available'])

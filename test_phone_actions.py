@@ -52,6 +52,28 @@ class TapScriptTests(unittest.TestCase):
         self.assertEqual(len(tap_calls), 1)
         self.assertEqual(tap_calls[0][-2:], ['360', '919'])
 
+    def test_tap_by_text_matches_content_desc(self):
+        script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps({'attr': 'text', 'target': '搜索'}, ensure_ascii=False)), 1)
+        xml = ('<hierarchy><node package="com.max.xiaoheihe" class="android.widget.FrameLayout" text="" '
+               'content-desc="搜索" bounds="[0,0][80,80]" clickable="true" enabled="true"/></hierarchy>')
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args)
+            command = args[3:]
+            if command[:2] == ['shell', 'dumpsys']:
+                return SimpleNamespace(returncode=0, stdout=FOCUS, stderr='')
+            if command[:2] == ['shell', 'uiautomator']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if command[:2] == ['shell', 'cat']:
+                return SimpleNamespace(returncode=0, stdout=xml, stderr='')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+        output = io.StringIO()
+        with patch('subprocess.run', run), redirect_stdout(output):
+            exec(script, {})
+        self.assertEqual(json.loads(output.getvalue())['bounds'], [0, 0, 80, 80])
+
     def test_tap_reports_not_interactive_without_clickable_ancestor(self):
         script = _TAP_SCRIPT.replace('PAYLOAD', repr(json.dumps({'attr': 'resource-id', 'target': 'missing'})), 1)
         with patch('subprocess.run', fake_run([])), self.assertRaisesRegex(RuntimeError, 'missing_or_ambiguous_target'):
@@ -64,7 +86,8 @@ class ActionCommandTests(unittest.TestCase):
         self.assertIn(PACKAGE + ':id/et_editor', command)
         text_command = action_command('phone_tap', {'target': '发布', 'match': 'text'}, {})
         self.assertIn('发布', text_command)
-        self.assertNotIn('resource-id', text_command)
+        self.assertIn('"attr": "text"', text_command)
+        self.assertIn('content-desc', text_command)
 
     def test_input_embeds_only_frozen_text(self):
         command = action_command('phone_input', {'target': 'et_editor'}, {'text': '冻结原文'})

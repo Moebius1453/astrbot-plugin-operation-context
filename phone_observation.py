@@ -19,6 +19,7 @@ class PhoneNode:
     bounds: tuple[int, int, int, int]
     clickable: bool
     enabled: bool
+    desc: str = ''
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ def parse_xml(content: str) -> tuple[PhoneNode, ...]:
             element.get('resource-id', ''), element.get('class', ''),
             element.get('text', ''), bounds,
             element.get('clickable') == 'true', element.get('enabled') == 'true',
+            element.get('content-desc', ''),
         ))
     if not nodes:
         raise ValueError('empty_hierarchy')
@@ -226,7 +228,7 @@ def describe(observation: PhoneObservation, limit: int = 120) -> dict:
     text_available = observation.source == 'uiautomator'
     meaningful = [
         node for node in observation.nodes
-        if node.text or node.identifier or node.clickable
+        if node.text or node.identifier or node.clickable or node.desc
     ]
     prefix = PACKAGE + ':id/'
     return {
@@ -241,6 +243,7 @@ def describe(observation: PhoneObservation, limit: int = 120) -> dict:
                 'id': node.identifier.removeprefix(prefix),
                 'class': node.class_name,
                 'text': node.text if text_available else None,
+                'desc': node.desc,
                 'bounds': list(node.bounds),
                 'clickable': node.clickable,
                 'enabled': node.enabled,

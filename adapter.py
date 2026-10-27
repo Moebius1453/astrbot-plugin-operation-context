@@ -172,6 +172,7 @@ class CapabilityBackend:
         self.shell = shell
         self.run_context = run_context
         self.frozen = frozen or {}
+        self.images = []
 
     async def _envelope(self, command, timeout):
         raw = await self.shell.call(
@@ -195,11 +196,17 @@ class CapabilityBackend:
             if envelope.get('exit_code') != 0:
                 raise ValueError('action_failed_state_unknown')
             output = envelope.get('stdout')
-            if not isinstance(output, str) or len(output) > 4096:
+            limit = 3_000_000 if action == 'phone_screenshot' else 4096
+            if not isinstance(output, str) or len(output) > limit:
                 raise ValueError('invalid_action_receipt')
             data = json.loads(output)
             if not isinstance(data, dict):
                 raise ValueError('invalid_action_receipt')
+            if action == 'phone_screenshot':
+                image = data.pop('image', None)
+                if not isinstance(image, str) or not image.startswith('data:image/png;base64,'):
+                    raise ValueError('invalid_screenshot_image')
+                self.images = [image]
             return parse_receipt(action, data)
         envelope = await self._envelope(COMMANDS[action], 20)
         if envelope.get('exit_code') != 0:

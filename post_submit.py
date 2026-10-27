@@ -46,6 +46,8 @@ def tap(node):
     run(['shell','input','tap',str((x1+x2)//2),str((y1+y2)//2)])
 if focus()!='com.max.xiaoheihe.module.bbs.post_edit.PostTabActivity': raise RuntimeError('editor_required')
 root=controls()
+type_bar=[node for node in root.iter('node') if node.get('resource-id')=='com.max.xiaoheihe:id/tv_appbar_title']
+if len(type_bar)!=1 or (type_bar[0].get('text') or '').strip()!='内容': raise RuntimeError('post_type_not_normal')
 for identifier,expected in [('com.max.xiaoheihe:id/et_title',payload['title']),('com.max.xiaoheihe:id/et_content',payload['text'])]:
     nodes=[node for node in root.iter('node') if node.get('resource-id')==identifier]
     if len(nodes)!=1 or nodes[0].get('text')!=expected: raise RuntimeError('editor_content_mismatch')

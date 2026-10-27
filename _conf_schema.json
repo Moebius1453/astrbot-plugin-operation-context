@@ -13,5 +13,10 @@
     "description": "单个受限能力超时秒数，1至60",
     "type": "int",
     "default": 60
+  },
+  "executor_provider": {
+    "description": "子代理使用的模型ID，留空则用当前聊天模型。截图会作为图片输入交给子代理",
+    "type": "string",
+    "default": ""
   }
 }

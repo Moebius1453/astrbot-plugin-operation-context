@@ -104,7 +104,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             result = await CapabilityBackend(shell, None).execute('phone_observe')
         self.assertEqual(result['activity'], PACKAGE + '.MainActivity')
         self.assertEqual(result['nodes'], [{
-            'id': 'et_title', 'class': 'android.widget.EditText', 'text': '标题',
+            'id': 'et_title', 'class': 'android.widget.EditText', 'text': '标题', 'desc': '',
             'bounds': [1, 2, 3, 4], 'clickable': True, 'enabled': True,
         }])
         observe.assert_awaited_once()
@@ -155,6 +155,27 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'action_failed_state_unknown'):
             await CapabilityBackend(shell, None).execute('phone_back', {})
         self.assertEqual(shell.call.await_count, 1)
+
+    async def test_screenshot_image_stays_inside_executor(self):
+        image = 'data:image/png;base64,' + 'A' * 2000
+        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
+            'exit_code': 0,
+            'stdout': json.dumps({'screenshot': '/workspace/phone-shot-' + 'a' * 32 + '.png',
+                                  'bytes': 12, 'image': image}),
+        })))
+        backend = CapabilityBackend(shell, None)
+        result = await backend.execute('phone_screenshot', {})
+        self.assertEqual(result['action'], 'screenshot')
+        self.assertNotIn('image', result)
+        self.assertEqual(backend.images, [image])
+
+    async def test_screenshot_without_image_is_rejected(self):
+        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
+            'exit_code': 0,
+            'stdout': json.dumps({'screenshot': '/workspace/phone-shot-' + 'a' * 32 + '.png', 'bytes': 12}),
+        })))
+        with self.assertRaisesRegex(ValueError, 'invalid_screenshot_image'):
+            await CapabilityBackend(shell, None).execute('phone_screenshot', {})
 
     async def test_unknown_capability_never_reaches_shell(self):
         shell = SimpleNamespace(call=AsyncMock())

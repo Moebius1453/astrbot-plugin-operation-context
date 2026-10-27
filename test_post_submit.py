@@ -23,6 +23,8 @@ class PostPayloadTests(unittest.TestCase):
         self.assertIn('正文', command)
         self.assertIn('editor_required', command)
         self.assertIn('editor_content_mismatch', command)
+        self.assertIn('post_type_not_normal', command)
+        self.assertIn('tv_appbar_title', command)
         self.assertIn('直接发布', command)
         self.assertIn('172.22.0.2:5555', command)
         self.assertNotIn('send_message_to_user', command)

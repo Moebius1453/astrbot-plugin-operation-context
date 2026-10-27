@@ -86,10 +86,19 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_action_target_is_passed_to_backend(self):
         result = await self.run_task(
-            Planner([response(['phone_tap'], [{'target': 'et_editor'}])]), actions=('phone_tap',),
+            Planner([response(['phone_observe']), response(['phone_tap'], [{'target': 'x'}]), response([])]),
+            actions=('phone_observe', 'phone_tap'),
         )
         self.assertEqual(result['status'], 'observations_returned')
-        self.assertEqual(self.backend.calls, [('phone_tap', {'target': 'et_editor'})])
+        self.assertEqual(self.backend.calls, [('phone_observe', {}), ('phone_tap', {'target': 'x'})])
+
+    async def test_action_without_prior_observation_does_nothing(self):
+        result = await self.run_task(
+            Planner([response(['phone_tap'], [{'target': 'et_editor'}]), response([])]), actions=('phone_tap',),
+        )
+        self.assertEqual(self.backend.calls, [])
+        self.assertEqual(result['action_count'], 0)
+        self.assertEqual(result['final']['result'], {'error': 'observe_first'})
 
     async def test_input_requires_host_frozen_text(self):
         result = await self.run_task(
@@ -105,7 +114,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_actions_can_repeat_and_result_stays_compact(self):
         planner = Planner([
             response(['phone_observe']),
-            response(['phone_tap'], [{'target': 'et_editor'}]),
+            response(['phone_tap'], [{'target': 'x'}]),
             response(['phone_observe']),
             response([]),
         ])
@@ -131,6 +140,20 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('nodes', result['final'])
         self.assertEqual(result['final']['node_count'], 2)
         self.assertNotIn('目标文字', json.dumps(result, ensure_ascii=False))
+
+    async def test_final_reports_deterministic_screen_kind(self):
+        class EditorBackend(Backend):
+            async def execute(self, name, args=None):
+                self.calls.append((name, args))
+                return {'activity': 'com.max.xiaoheihe.module.bbs.post_edit.PostTabActivity',
+                        'source': 'uiautomator', 'text_available': True, 'node_count': 3,
+                        'truncated': False, 'nodes': [{'id': 'et_title'}, {'id': 'et_content'}, {'id': 'x'}]}
+
+        planner = Planner([response(['phone_observe'])])
+        result = await self.executor.run(
+            context=planner, provider_id='x', goal='g', actions=('phone_observe',), backend=EditorBackend(),
+        )
+        self.assertEqual(result['final']['screen'], 'post_editor')
 
     async def test_expect_text_returns_boolean_only(self):
         planner = Planner([response(['phone_observe'])])
@@ -159,6 +182,78 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_task(planner, actions=('phone_observe',), max_steps=3)
         self.assertEqual(result['reason'], 'step_limit')
         self.assertEqual(len(self.backend.calls), 3)
+
+    async def test_unknown_target_never_reaches_the_phone(self):
+        planner = Planner([
+            response(['phone_observe']),
+            response(['phone_tap'], [{'target': 'post_tools_tabs_area'}]),
+            response(['phone_tap'], [{'target': 'x'}]),
+            response([]),
+        ])
+        result = await self.run_task(planner, actions=('phone_observe', 'phone_tap'))
+        self.assertEqual([call[0] for call in self.backend.calls], ['phone_observe', 'phone_tap'])
+        self.assertEqual(result['action_count'], 1)
+        self.assertEqual(result['actions_taken'][0]['capability'], 'phone_tap')
+
+    async def test_identical_receipts_are_not_repeated_to_parent(self):
+        planner = Planner([
+            response(['phone_screenshot']),
+            response(['phone_observe']),
+            response(['phone_screenshot']),
+            response(['phone_screenshot']),
+            response([]),
+        ])
+        result = await self.run_task(planner, actions=('phone_observe', 'phone_screenshot'))
+        self.assertEqual(result['action_count'], 2)
+        self.assertEqual(len(result['actions_taken']), 1)
+
+    async def test_vision_attaches_only_to_following_round(self):
+        class ImageBackend(Backend):
+            def __init__(self):
+                super().__init__()
+                self.images = []
+
+            async def execute(self, name, args=None):
+                result = await super().execute(name, args)
+                if name == 'phone_screenshot':
+                    self.images = ['data:image/png;base64,AAA']
+                return result
+
+        planner = Planner([response(['phone_screenshot']), response([])])
+        backend = ImageBackend()
+        await self.executor.run(
+            context=planner, provider_id='x', goal='g', actions=('phone_screenshot',),
+            backend=backend, vision=True,
+        )
+        self.assertIsNone(planner.requests[0]['image_urls'])
+        self.assertEqual(planner.requests[1]['image_urls'], ['data:image/png;base64,AAA'])
+
+    async def test_images_are_not_sent_without_vision(self):
+        class ImageBackend(Backend):
+            def __init__(self):
+                super().__init__()
+                self.images = ['data:image/png;base64,AAA']
+
+            async def execute(self, name, args=None):
+                return await super().execute(name, args)
+
+        planner = Planner([response(['phone_status']), response([])])
+        await self.executor.run(
+            context=planner, provider_id='x', goal='g', actions=('phone_status',),
+            backend=ImageBackend(), vision=False,
+        )
+        self.assertTrue(all(request['image_urls'] is None for request in planner.requests))
+
+    async def test_post_type_title_cannot_be_tapped(self):
+        planner = Planner([
+            response(['phone_observe']),
+            response(['phone_tap'], [{'target': 'tv_appbar_title'}]),
+            response(['phone_tap'], [{'target': 'x'}]),
+            response([]),
+        ])
+        result = await self.run_task(planner, actions=('phone_observe', 'phone_tap'))
+        self.assertEqual([call[0] for call in self.backend.calls], ['phone_observe', 'phone_tap'])
+        self.assertEqual(result['action_count'], 1)
 
     async def test_batch_validated_before_any_action(self):
         result = await self.run_task(Planner([response(['phone_status', 'send_message_to_user'])]))

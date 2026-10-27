@@ -34,7 +34,10 @@ def run(args,timeout=12):
 ''' + _FOCUS_GUARD + _DUMP_GUARD + r'''focus()
 root=controls()
 parents={child:parent for parent in root.iter() for child in parent}
-hits=[node for node in root.iter('node') if node.get(payload['attr'])==payload['target']]
+if payload['attr']=='text':
+    hits=[node for node in root.iter('node') if node.get('text')==payload['target'] or node.get('content-desc')==payload['target']]
+else:
+    hits=[node for node in root.iter('node') if node.get('resource-id')==payload['target']]
 if len(hits)!=1: raise RuntimeError('missing_or_ambiguous_target')
 node=hits[0]
 while node is not None and node.tag=='node' and node.get('clickable')!='true':
@@ -135,13 +138,13 @@ run(['shell','input','swipe']+[str(value) for value in args]+['300'])
 print(json.dumps({'swipe_attempted':True,'bounds':[x1,y1,x2,y2]}))
 '''
 
-_SCREENSHOT_SCRIPT = r'''import json,subprocess,uuid
+_SCREENSHOT_SCRIPT = r'''import base64,json,subprocess,uuid
 adb=[''' + _ADB + r''']
 path='/workspace/phone-shot-'+uuid.uuid4().hex+'.png'
 r=subprocess.run(adb+['exec-out','screencap','-p'],capture_output=True,timeout=20)
 if r.returncode or not r.stdout.startswith(b'\x89PNG'): raise RuntimeError('screenshot_failed')
 open(path,'wb').write(r.stdout)
-print(json.dumps({'screenshot':path,'bytes':len(r.stdout)}))
+print(json.dumps({'screenshot':path,'bytes':len(r.stdout),'image':'data:image/png;base64,'+base64.b64encode(r.stdout).decode('ascii')}))
 '''
 
 _SAFE_ID = re.compile(r'^[A-Za-z0-9_.]+$')
