@@ -34,7 +34,7 @@ if not os.path.isfile(adb):
 r = subprocess.run([adb, '-s', '172.22.0.2:5555', 'shell', 'dumpsys', 'activity', 'activities'], capture_output=True, text=True, timeout=10)
 if r.returncode != 0:
     raise RuntimeError('foreground_query_failed')
-packages = re.findall(r'mResumedActivity:.*?\\s([A-Za-z0-9_.]+)/', r.stdout)
+packages = re.findall(r'(?:mResumedActivity:|topResumedActivity=|ResumedActivity:).*?\\s([A-Za-z0-9_.]+)/', r.stdout)
 print(json.dumps({'scope': 'allowed_app' if packages and set(packages) == {'com.max.xiaoheihe'} else 'blocked_or_unknown'}))
 '''
 COMMANDS = {
