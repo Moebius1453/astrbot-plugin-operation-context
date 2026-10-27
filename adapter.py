@@ -37,7 +37,7 @@ SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
     'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_screenshot', 'phone_input',
+    'phone_screenshot', 'phone_input', 'post_submit',
 })
 ACTION_CAPABILITIES = frozenset({
     'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',

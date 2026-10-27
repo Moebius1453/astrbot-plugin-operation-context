@@ -25,7 +25,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(CAPABILITIES, {
             'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
             'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-            'phone_screenshot', 'phone_input',
+            'phone_screenshot', 'phone_input', 'post_submit',
         })
 
     def test_action_arguments_are_closed_set(self):

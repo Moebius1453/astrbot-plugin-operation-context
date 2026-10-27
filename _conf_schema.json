@@ -1,6 +1,6 @@
 {
   "allowed_capabilities": {
-    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_screenshot、phone_input。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行一次，文字必须由主对话原文提供。不提供QQ、任意命令、发布或评论。",
+    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_screenshot、phone_input、post_submit。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行，文字必须由主对话原文提供；post_submit必须单独使用，提交前落unknown，提交后读回，未知不重试。不提供QQ、任意命令或评论发布。",
     "type": "list",
     "default": []
   },
