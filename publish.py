@@ -19,6 +19,8 @@ THIS TASK IS A DELETION
 
 PATH_PATTERN = re.compile(r'^/workspace/[A-Za-z0-9._-]+\.(png|jpg|jpeg)$')
 
+IMAGES_ENABLED = False
+
 
 def validate_publish(title, text, images, mention):
     if not isinstance(title, str) or not title.strip() or len(title) > 100:
@@ -30,11 +32,15 @@ def validate_publish(title, text, images, mention):
     if any(ord(character) < 32 and character not in '\n\t' for character in text):
         raise ValueError('invalid_post_text')
     if images is not None:
-        if not isinstance(images, list) or len(images) > 9:
-            raise ValueError('invalid_post_images')
-        for path in images:
-            if not isinstance(path, str) or not PATH_PATTERN.fullmatch(path):
-                raise ValueError('invalid_post_image_path')
+        if not IMAGES_ENABLED:
+            if images:
+                raise ValueError('post_images_disabled')
+        else:
+            if not isinstance(images, list) or len(images) > 9:
+                raise ValueError('invalid_post_images')
+            for path in images:
+                if not isinstance(path, str) or not PATH_PATTERN.fullmatch(path):
+                    raise ValueError('invalid_post_image_path')
     if mention is not None and mention != '':
         if not isinstance(mention, str) or not mention.strip() or len(mention) > 50:
             raise ValueError('invalid_post_mention')

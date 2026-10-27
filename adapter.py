@@ -54,13 +54,20 @@ TOOL_NAME = 'operation_context_run'
 SNAPSHOT_KEY = 'operation_context_authorized_tools'
 CAPABILITIES = frozenset({
     'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
-    'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_screenshot', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
+    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+    'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
 })
 ACTION_CAPABILITIES = frozenset({
-    'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-    'phone_screenshot', 'phone_input',
+    'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app', 'phone_input',
 })
+# Tier 1 reads state, tier 2 changes the phone but stays reversible inside the app,
+# tier 3 can be seen by someone outside this conversation. Tier 3 never shares a task.
+CAPABILITY_TIERS = {
+    'sandbox_status': 1, 'phone_status': 1, 'phone_app_scope': 1, 'phone_observe': 1,
+    'phone_tap': 2, 'phone_swipe': 2, 'phone_back': 2, 'phone_home': 2,
+    'phone_start_app': 2, 'phone_input': 2,
+    'post_submit': 3, 'post_publish': 3, 'post_delete': 3, 'sandbox_agent': 3,
+}
 SHELL_NAME = 'astrbot_execute_shell'
 
 _SANDBOX_SCRIPT = '''import json, os, shutil
@@ -109,6 +116,22 @@ def validate_actions(actions, configured):
     return tuple(actions)
 
 
+def resolve_actions(actions, configured):
+    """Return the permitted capabilities and the tier-3 one, if any.
+
+    Omitting actions means free execution. A capability that can be seen from
+    outside this conversation is never combined with anything else, because the
+    host can no longer say which part produced the outward effect.
+    """
+    if actions is None or actions == []:
+        actions = ['sandbox_agent']
+    permitted = validate_actions(actions, configured)
+    outward = [name for name in permitted if CAPABILITY_TIERS[name] == 3]
+    if outward and len(permitted) > 1:
+        raise ValueError('outward_action_must_be_alone')
+    return permitted, outward[0] if outward else None
+
+
 ACTION_SCHEMAS = {
     'phone_tap': {
         'type': 'object',
@@ -124,17 +147,8 @@ ACTION_SCHEMAS = {
         'required': ['target'], 'additionalProperties': False,
     },
     'phone_back': {'type': 'object', 'properties': {}, 'additionalProperties': False},
-    'phone_tap_at': {
-        'type': 'object',
-        'properties': {
-            'x': {'type': 'integer', 'minimum': 0, 'maximum': 719},
-            'y': {'type': 'integer', 'minimum': 0, 'maximum': 1183},
-        },
-        'required': ['x', 'y'], 'additionalProperties': False,
-    },
     'phone_home': {'type': 'object', 'properties': {}, 'additionalProperties': False},
     'phone_start_app': {'type': 'object', 'properties': {}, 'additionalProperties': False},
-    'phone_screenshot': {'type': 'object', 'properties': {}, 'additionalProperties': False},
     'phone_swipe': {
         'type': 'object',
         'properties': {
@@ -205,7 +219,6 @@ class CapabilityBackend:
         self.shell = shell
         self.run_context = run_context
         self.frozen = frozen or {}
-        self.images = []
 
     async def _envelope(self, command, timeout):
         raw = await self.shell.call(
@@ -229,17 +242,11 @@ class CapabilityBackend:
             if envelope.get('exit_code') != 0:
                 raise ValueError(action_failure(envelope))
             output = envelope.get('stdout')
-            limit = 3_000_000 if action == 'phone_screenshot' else 4096
-            if not isinstance(output, str) or len(output) > limit:
+            if not isinstance(output, str) or len(output) > 4096:
                 raise ValueError('invalid_action_receipt')
             data = json.loads(output)
             if not isinstance(data, dict):
                 raise ValueError('invalid_action_receipt')
-            if action == 'phone_screenshot':
-                image = data.pop('image', None)
-                if not isinstance(image, str) or not image.startswith('data:image/png;base64,'):
-                    raise ValueError('invalid_screenshot_image')
-                self.images = [image]
             return parse_receipt(action, data)
         envelope = await self._envelope(COMMANDS[action], 20)
         if envelope.get('exit_code') != 0:

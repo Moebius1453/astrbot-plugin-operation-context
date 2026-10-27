@@ -8,6 +8,21 @@ from types import SimpleNamespace
 from .sandbox_agent import SandboxAgent
 
 
+class Response:
+    def __init__(self, names=None, arguments=None, text=''):
+        self.tools_call_name = names or []
+        self.tools_call_args = arguments or []
+        self.tools_call_ids = [f'call_{index}' for index in range(len(self.tools_call_name))]
+        self.completion_text = text
+
+    def to_openai_tool_calls_model(self):
+        return [
+            {'id': call_id, 'type': 'function',
+             'function': {'name': name, 'arguments': json.dumps(argument)}}
+            for name, argument, call_id in zip(self.tools_call_name, self.tools_call_args, self.tools_call_ids)
+        ]
+
+
 class Planner:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -15,16 +30,15 @@ class Planner:
 
     async def llm_generate(self, **kwargs):
         self.requests.append(kwargs)
-        return self.responses.pop(0) if self.responses else SimpleNamespace(
-            tools_call_name=[], tools_call_args=[], completion_text='')
+        return self.responses.pop(0) if self.responses else Response(text='')
 
 
 def call(command):
-    return SimpleNamespace(tools_call_name=['sandbox_shell'], tools_call_args=[{'command': command}], completion_text='')
+    return Response(['sandbox_shell'], [{'command': command}])
 
 
 def done(text):
-    return SimpleNamespace(tools_call_name=[], tools_call_args=[], completion_text=text)
+    return Response(text=text)
 
 
 class Shell:
@@ -64,11 +78,25 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((record / 'commands.jsonl').exists())
         self.assertTrue((record / 'result.json').exists())
 
+    async def test_history_is_carried_between_turns(self):
+        planner = Planner([call('echo a'), done('好了。')])
+        await self.run_agent(planner, Shell())
+        roles = [message.role for message in planner.requests[1]['contexts']]
+        self.assertEqual(roles, ['user', 'assistant', 'tool'])
+        self.assertEqual(planner.requests[1]['contexts'][2].tool_call_id, 'call_0')
+        self.assertIn('ok', planner.requests[1]['contexts'][2].content)
+
+    async def test_no_image_channel_is_used(self):
+        planner = Planner([call('echo a'), done('好了。')])
+        await self.run_agent(planner, Shell())
+        for request in planner.requests:
+            self.assertNotIn('image_urls', request)
+        tools = planner.requests[0]['tools'].tools
+        self.assertEqual([tool.name for tool in tools], ['sandbox_shell'])
+
     async def test_multiple_commands_in_one_turn_are_allowed(self):
         planner = Planner([
-            SimpleNamespace(tools_call_name=['sandbox_shell', 'sandbox_shell'],
-                            tools_call_args=[{'command': 'echo a'}, {'command': 'echo b'}],
-                            completion_text=''),
+            Response(['sandbox_shell', 'sandbox_shell'], [{'command': 'echo a'}, {'command': 'echo b'}]),
             done('两条都跑了。'),
         ])
         shell = Shell()
@@ -78,8 +106,7 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shell.commands, ['echo a', 'echo b'])
 
     async def test_rejects_tools_other_than_shell(self):
-        planner = Planner([SimpleNamespace(
-            tools_call_name=['send_message_to_user'], tools_call_args=[{}], completion_text='')])
+        planner = Planner([Response(['send_message_to_user'], [{}])])
         shell = Shell()
         result = await self.run_agent(planner, shell)
         self.assertEqual(result['status'], 'rejected')
@@ -92,27 +119,14 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'rejected')
         self.assertEqual(shell.commands, [])
 
-    async def test_view_image_attaches_png_to_next_turn(self):
-        planner = Planner([
-            SimpleNamespace(tools_call_name=['view_image'],
-                            tools_call_args=[{'path': '/workspace/phone-shot-abc.png'}],
-                            completion_text=''),
-            done('看到了编辑页。'),
-        ])
-        shell = Shell(results={"base64 -w0 '/workspace/phone-shot-abc.png'":
-                               {'exit_code': 0, 'stdout': 'iVBORw0KGgo=', 'stderr': ''}})
-        result = await self.run_agent(planner, shell)
-        self.assertEqual(result['status'], 'completed')
-        self.assertIsNone(planner.requests[0]['image_urls'])
-        self.assertEqual(planner.requests[1]['image_urls'], ['data:image/png;base64,iVBORw0KGgo='])
+    async def test_failure_reports_exception_text(self):
+        class Broken:
+            async def llm_generate(self, **kwargs):
+                raise RuntimeError('quota exceeded for this key')
 
-    async def test_view_image_rejects_paths_outside_workspace(self):
-        planner = Planner([SimpleNamespace(tools_call_name=['view_image'],
-                                           tools_call_args=[{'path': '/etc/passwd'}], completion_text='')])
-        shell = Shell()
-        result = await self.run_agent(planner, shell)
-        self.assertEqual(result['status'], 'rejected')
-        self.assertEqual(shell.commands, [])
+        result = await self.run_agent(Broken(), Shell())
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('quota exceeded', result['summary'])
 
     async def test_frozen_text_is_written_once_before_commands(self):
         planner = Planner([done('好')])
@@ -131,8 +145,49 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['command_count'], 2)
         self.assertIsNone(result['summary'])
 
+    async def test_blocked_commands_never_reach_the_shell(self):
+        planner = Planner([call('pm clear com.max.xiaoheihe'), done('被拦下了。')])
+        shell = Shell()
+        result = await self.run_agent(planner, shell)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(shell.commands, [])
+        self.assertEqual(result['command_count'], 0)
+        blocked = json.loads(planner.requests[1]['contexts'][2].content)
+        self.assertEqual(blocked['reason'], 'package_mutation')
+        record = Path(result['raw_record'])
+        lines = (record / 'commands.jsonl').read_text(encoding='utf-8').splitlines()
+        self.assertTrue(any('"blocked"' in line for line in lines))
+
+    async def test_device_action_count_is_reported(self):
+        planner = Planner([
+            call('/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input tap 1 1'),
+            done('点了一下。'),
+        ])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['device_action_count'], 1)
+
+    async def test_old_results_are_compacted(self):
+        class Verbose:
+            async def call(self, run_context, command, background=False, timeout=None):
+                return json.dumps({'exit_code': 0, 'stdout': 'x' * 800, 'stderr': ''})
+
+        commands = [f'echo step-{index}' for index in range(12)]
+        planner = Planner([call(command) for command in commands] + [done('完')])
+        result = await self.run_agent(planner, Verbose(), max_steps=20)
+        self.assertEqual(result['status'], 'completed')
+        texts = [message.content for message in planner.requests[-1]['contexts'] if message.role == 'tool']
+        self.assertEqual(len(texts), 12)
+        self.assertIn('older result compacted', texts[0])
+        self.assertNotIn('older result compacted', texts[-1])
+
+    async def test_time_budget_stops_before_the_next_round(self):
+        planner = Planner([call('echo a')])
+        result = await self.run_agent(planner, Shell(), time_budget=0)
+        self.assertEqual(result['status'], 'time_budget')
+        self.assertEqual(planner.requests, [])
+
     async def test_limits_are_validated(self):
-        for kwargs in ({'max_steps': 0}, {'max_steps': True}, {'goal': ''}):
+        for kwargs in ({'max_steps': 0}, {'max_steps': 41}, {'max_steps': True}, {'goal': ''}):
             with self.assertRaises(ValueError):
                 await SandboxAgent(Shell(), None, self.root).run(
                     context=Planner([]), provider_id='p', goal=kwargs.pop('goal', 'g'), **kwargs,

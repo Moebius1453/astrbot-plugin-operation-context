@@ -8,20 +8,20 @@ class PublishRequestTests(unittest.TestCase):
         validate_publish('标题', '正文', None, None)
         validate_publish('标题', '正文', [], '')
 
-    def test_accepts_sandbox_images_and_mention(self):
-        validate_publish('标题', '正文', ['/workspace/a.png', '/workspace/b.jpg'], 'cannot_view')
+    def test_accepts_mention(self):
+        validate_publish('标题', '正文', None, 'cannot_view')
+
+    def test_images_are_disabled_for_now(self):
+        for images in (['/workspace/a.png'], ['/workspace/a.png', '/workspace/b.jpg'], ['/etc/passwd']):
+            with self.assertRaisesRegex(ValueError, 'post_images_disabled'):
+                validate_publish('标题', '正文', images, None)
+        validate_publish('标题', '正文', [], None)
 
     def test_rejects_bad_title_and_body(self):
         for title, text in (('', '正文'), ('x' * 101, '正文'), ('标题', ''), ('标题', 'y' * 4001),
                             ('标题\x00', '正文'), ('标题', '正文\x07')):
             with self.assertRaises(ValueError):
                 validate_publish(title, text, None, None)
-
-    def test_rejects_unsafe_image_paths(self):
-        for images in (['/etc/passwd'], ['/workspace/../../x.png'], ['/workspace/a.txt'],
-                       ['a.png'], ['/workspace/a.png'] * 10, 'a.png'):
-            with self.assertRaises(ValueError):
-                validate_publish('标题', '正文', images, None)
 
     def test_rejects_control_characters_in_mention(self):
         for mention in ('x' * 51, 'a\x00b', '   '):
@@ -36,10 +36,8 @@ class GoalTests(unittest.TestCase):
         self.assertIn('/tmp/operation-body.txt', goal)
         self.assertIn('stop', goal)
 
-    def test_goal_mentions_images_and_native_picker(self):
-        goal = build_goal(['/workspace/a.png'], 'cannot_view')
-        self.assertIn('/workspace/a.png', goal)
-        self.assertIn('media scan', goal)
+    def test_goal_mentions_native_picker(self):
+        goal = build_goal(None, 'cannot_view')
         self.assertIn('cannot_view', goal)
         self.assertIn('native mention picker', goal)
 

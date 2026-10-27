@@ -12,6 +12,7 @@ from .adapter import (
     COMMANDS,
     build_backend,
     planner_tools,
+    resolve_actions,
     screen_observation,
     validate_actions,
     validate_arguments,
@@ -24,8 +25,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_capability_set_is_narrow(self):
         self.assertEqual(CAPABILITIES, {
             'sandbox_status', 'phone_status', 'phone_app_scope', 'phone_observe',
-            'phone_tap', 'phone_tap_at', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
-            'phone_screenshot', 'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
+            'phone_tap', 'phone_swipe', 'phone_back', 'phone_home', 'phone_start_app',
+            'phone_input', 'post_submit', 'post_publish', 'post_delete', 'sandbox_agent',
         })
 
     def test_action_arguments_are_closed_set(self):
@@ -44,13 +45,6 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 validate_arguments(action, arguments, frozen)
         self.assertEqual(validate_arguments('phone_input', {'target': 'et_editor'}, {'text': '原文'})['target'], 'et_editor')
 
-    def test_tap_at_accepts_only_integer_coordinates_in_bounds(self):
-        self.assertEqual(validate_arguments('phone_tap_at', {'x': 360, 'y': 900}, {}), {'x': 360, 'y': 900})
-        for arguments in ({'x': 720, 'y': 900}, {'x': 360, 'y': 1184}, {'x': -1, 'y': 10},
-                          {'x': True, 'y': 10}, {'x': '360', 'y': 900}, {'x': 1.5, 'y': 10}, {'x': 1}):
-            with self.assertRaises(ValueError):
-                validate_arguments('phone_tap_at', arguments, {})
-
     def test_permissions_are_closed_set(self):
         self.assertEqual(validate_actions(['phone_status'], ['phone_status']), ('phone_status',))
         for actions, configured in [
@@ -62,6 +56,23 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         ]:
             with self.assertRaises(ValueError):
                 validate_actions(actions, configured)
+
+    def test_omitting_actions_means_free_execution(self):
+        self.assertEqual(resolve_actions(None, ['sandbox_agent']), (('sandbox_agent',), 'sandbox_agent'))
+        self.assertEqual(resolve_actions([], ['sandbox_agent']), (('sandbox_agent',), 'sandbox_agent'))
+
+    def test_outward_capabilities_never_share_a_task(self):
+        configured = ['post_publish', 'phone_observe', 'sandbox_agent', 'phone_back']
+        self.assertEqual(
+            resolve_actions(['post_publish'], configured), (('post_publish',), 'post_publish')
+        )
+        self.assertEqual(
+            resolve_actions(['phone_back', 'phone_observe'], configured),
+            (('phone_back', 'phone_observe'), None),
+        )
+        for actions in (['post_publish', 'phone_observe'], ['phone_back', 'sandbox_agent']):
+            with self.assertRaises(ValueError):
+                resolve_actions(actions, configured)
 
     def test_model_tools_have_empty_parameter_schema(self):
         for tool in planner_tools(('phone_status', 'phone_app_scope')).tools:
@@ -162,27 +173,6 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'action_failed_state_unknown'):
             await CapabilityBackend(shell, None).execute('phone_back', {})
         self.assertEqual(shell.call.await_count, 1)
-
-    async def test_screenshot_image_stays_inside_executor(self):
-        image = 'data:image/png;base64,' + 'A' * 2000
-        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
-            'exit_code': 0,
-            'stdout': json.dumps({'screenshot': '/workspace/phone-shot-' + 'a' * 32 + '.png',
-                                  'bytes': 12, 'image': image}),
-        })))
-        backend = CapabilityBackend(shell, None)
-        result = await backend.execute('phone_screenshot', {})
-        self.assertEqual(result['action'], 'screenshot')
-        self.assertNotIn('image', result)
-        self.assertEqual(backend.images, [image])
-
-    async def test_screenshot_without_image_is_rejected(self):
-        shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({
-            'exit_code': 0,
-            'stdout': json.dumps({'screenshot': '/workspace/phone-shot-' + 'a' * 32 + '.png', 'bytes': 12}),
-        })))
-        with self.assertRaisesRegex(ValueError, 'invalid_screenshot_image'):
-            await CapabilityBackend(shell, None).execute('phone_screenshot', {})
 
     async def test_pre_action_failure_is_classified(self):
         shell = SimpleNamespace(call=AsyncMock(return_value=json.dumps({

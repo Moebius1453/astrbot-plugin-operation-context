@@ -148,12 +148,6 @@ class ActionCommandTests(unittest.TestCase):
         self.assertIn('unsafe_target_bounds', command)
         self.assertIn('"direction": "up"', command)
 
-    def test_screenshot_only_writes_workspace_png(self):
-        command = action_command('phone_screenshot', {}, {})
-        self.assertIn('/workspace/phone-shot-', command)
-        self.assertIn('screencap', command)
-        self.assertIn('\\x89PNG', command)
-
 
 class ReceiptTests(unittest.TestCase):
     def test_tap_receipt_requires_attempt_and_bounds(self):
@@ -179,14 +173,7 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_receipt('phone_back', {'back_attempted': False})
 
-    def test_swipe_home_and_screenshot_receipts(self):
+    def test_swipe_and_home_receipts(self):
         self.assertEqual(parse_receipt('phone_swipe', {'swipe_attempted': True, 'bounds': [0, 0, 10, 10]}),
                          {'action': 'swipe', 'bounds': [0, 0, 10, 10]})
         self.assertEqual(parse_receipt('phone_home', {'home_attempted': True}), {'action': 'home'})
-        path = '/workspace/phone-shot-' + 'a' * 32 + '.png'
-        self.assertEqual(parse_receipt('phone_screenshot', {'screenshot': path, 'bytes': 12, 'width': 720, 'height': 1280}),
-                         {'action': 'screenshot', 'path': path, 'bytes': 12, 'width': 720, 'height': 1280})
-        for data in ({'screenshot': '/workspace/other.png', 'bytes': 12},
-                     {'screenshot': path, 'bytes': 0}):
-            with self.assertRaises(ValueError):
-                parse_receipt('phone_screenshot', data)

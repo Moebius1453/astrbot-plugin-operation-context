@@ -1,13 +1,13 @@
 {
   "allowed_capabilities": {
-    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_tap_at、phone_swipe、phone_back、phone_home、phone_start_app、phone_screenshot、phone_input、post_submit、sandbox_agent。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行；phone_tap_at只在同一任务先截图后可用；sandbox_agent必须单独使用，给执行器沙箱内shell自由操作，对外文字限制为input_text原文；post_submit必须单独使用，提交前落unknown，提交后读回，未知不重试。不提供QQ。",
+    "description": "允许的受限能力，可填：sandbox_status、phone_status、phone_app_scope、phone_observe、phone_tap、phone_swipe、phone_back、phone_home、phone_start_app、phone_input、post_submit、post_publish、post_delete、sandbox_agent。默认空，不继承旧allowed_tools。查询与只读观察不改变手机状态；动作只按当次控件树执行；sandbox_agent必须单独使用，给执行器沙箱内shell自由操作，对外文字限制为input_text原文；post_submit必须单独使用，提交前落unknown，提交后读回，未知不重试。不提供QQ，不提供截图和坐标点击。",
     "type": "list",
     "default": []
   },
   "max_steps": {
-    "description": "执行规划循环上限，1至24。每轮可请求多个动作，动作可在不同轮重复",
+    "description": "执行规划轮数上限，1至40。每轮可请求多个动作，动作可在不同轮重复",
     "type": "int",
-    "default": 10
+    "default": 30
   },
   "tool_call_timeout": {
     "description": "单个受限能力超时秒数，1至60",
@@ -15,7 +15,7 @@
     "default": 60
   },
   "executor_provider": {
-    "description": "子代理使用的模型ID，留空则用当前聊天模型。截图会作为图片输入交给子代理",
+    "description": "子代理使用的模型ID，留空则用当前聊天模型。子代理只通过控件树和 shell 感知，不使用图片",
     "type": "string",
     "default": ""
   }

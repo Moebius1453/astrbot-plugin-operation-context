@@ -22,23 +22,33 @@ class Planner:
 
 
 def response(names=(), args=None, text=''):
-    return SimpleNamespace(tools_call_name=list(names), tools_call_args=args if args is not None else [{} for _ in names], completion_text=text)
+    return FakeResponse(names, args, text)
+
+
+class FakeResponse:
+    def __init__(self, names=(), args=None, text=''):
+        self.tools_call_name = list(names)
+        self.tools_call_args = args if args is not None else [{} for _ in names]
+        self.tools_call_ids = [f'call_{index}' for index in range(len(self.tools_call_name))]
+        self.completion_text = text
+
+    def to_openai_tool_calls_model(self):
+        return [
+            {'id': call_id, 'type': 'function',
+             'function': {'name': name, 'arguments': json.dumps(argument)}}
+            for name, argument, call_id in zip(self.tools_call_name, self.tools_call_args, self.tools_call_ids)
+        ]
 
 
 class Backend:
     def __init__(self):
         self.calls = []
-        self.images = []
 
     async def execute(self, name, args=None):
         self.calls.append((name, args))
         if name == 'phone_observe':
             return {'activity': 'a', 'source': 'uiautomator', 'text_available': True, 'node_count': 2,
                     'truncated': False, 'nodes': [{'id': 'x', 'text': '目标文字'}]}
-        if name == 'phone_screenshot':
-            self.images = ['data:image/png;base64,AAA']
-            return {'action': 'screenshot', 'path': '/workspace/phone-shot-' + 'a' * 32 + '.png',
-                    'bytes': 10, 'width': 720, 'height': 1280}
         return {'state': 'device'}
 
 
@@ -59,7 +69,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.calls, [('phone_status', {})])
         request = planner.requests[0]
         self.assertEqual(request['system_prompt'], EXECUTION_PROTOCOL)
-        self.assertEqual(request['contexts'], [])
+        self.assertEqual([message.role for message in request['contexts']], ['user', 'assistant', 'tool'])
+        self.assertNotIn('prompt', request)
         self.assertNotIn('event', request)
         self.assertNotIn('persona', request)
         self.assertNotIn('model_report_excerpt', result)
@@ -114,7 +125,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         planner = Planner([response(['phone_input'], [{'target': 'et_editor'}])])
         result = await self.run_task(planner, actions=('phone_input',), frozen={'text': '原文'})
         self.assertEqual(result['status'], 'observations_returned')
-        self.assertEqual(planner.requests[0]['prompt'].count('frozen by host'), 1)
+        self.assertIn('frozen by host', planner.requests[0]['contexts'][0].content)
 
     async def test_actions_can_repeat_and_result_stays_compact(self):
         planner = Planner([
@@ -176,8 +187,8 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['rounds'], 1)
 
     async def test_identical_non_repeatable_call_stalls(self):
-        planner = Planner([response(['phone_screenshot'])] * 5)
-        result = await self.run_task(planner, actions=('phone_screenshot',))
+        planner = Planner([response(['phone_back'])] * 5)
+        result = await self.run_task(planner, actions=('phone_back',))
         self.assertEqual(result['reason'], 'stalled_repeat')
         self.assertEqual(len(self.backend.calls), 1)
         self.assertEqual(result['action_count'], 1)
@@ -202,52 +213,15 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_identical_receipts_are_not_repeated_to_parent(self):
         planner = Planner([
-            response(['phone_screenshot']),
+            response(['phone_back']),
             response(['phone_observe']),
-            response(['phone_screenshot']),
-            response(['phone_screenshot']),
+            response(['phone_back']),
+            response(['phone_back']),
             response([]),
         ])
-        result = await self.run_task(planner, actions=('phone_observe', 'phone_screenshot'))
+        result = await self.run_task(planner, actions=('phone_observe', 'phone_back'))
         self.assertEqual(result['action_count'], 2)
         self.assertEqual(len(result['actions_taken']), 1)
-
-    async def test_vision_attaches_only_to_following_round(self):
-        class ImageBackend(Backend):
-            def __init__(self):
-                super().__init__()
-                self.images = []
-
-            async def execute(self, name, args=None):
-                result = await super().execute(name, args)
-                if name == 'phone_screenshot':
-                    self.images = ['data:image/png;base64,AAA']
-                return result
-
-        planner = Planner([response(['phone_screenshot']), response([])])
-        backend = ImageBackend()
-        await self.executor.run(
-            context=planner, provider_id='x', goal='g', actions=('phone_screenshot',),
-            backend=backend, vision=True,
-        )
-        self.assertIsNone(planner.requests[0]['image_urls'])
-        self.assertEqual(planner.requests[1]['image_urls'], ['data:image/png;base64,AAA'])
-
-    async def test_images_are_not_sent_without_vision(self):
-        class ImageBackend(Backend):
-            def __init__(self):
-                super().__init__()
-                self.images = ['data:image/png;base64,AAA']
-
-            async def execute(self, name, args=None):
-                return await super().execute(name, args)
-
-        planner = Planner([response(['phone_status']), response([])])
-        await self.executor.run(
-            context=planner, provider_id='x', goal='g', actions=('phone_status',),
-            backend=ImageBackend(), vision=False,
-        )
-        self.assertTrue(all(request['image_urls'] is None for request in planner.requests))
 
     async def test_post_type_title_cannot_be_tapped(self):
         planner = Planner([
@@ -259,19 +233,6 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         result = await self.run_task(planner, actions=('phone_observe', 'phone_tap'))
         self.assertEqual([call[0] for call in self.backend.calls], ['phone_observe', 'phone_tap'])
         self.assertEqual(result['action_count'], 1)
-
-    async def test_tap_at_requires_a_screenshot_in_the_same_task(self):
-        planner = Planner([
-            response(['phone_tap_at'], [{'x': 360, 'y': 900}]),
-            response(['phone_screenshot']),
-            response(['phone_tap_at'], [{'x': 360, 'y': 900}]),
-            response([]),
-        ])
-        result = await self.run_task(
-            planner, actions=('phone_screenshot', 'phone_tap_at'), vision=True,
-        )
-        self.assertEqual([call[0] for call in self.backend.calls], ['phone_screenshot', 'phone_tap_at'])
-        self.assertEqual(result['action_count'], 2)
 
     async def test_pre_action_failure_does_not_kill_the_task(self):
         class Ambiguous(Backend):

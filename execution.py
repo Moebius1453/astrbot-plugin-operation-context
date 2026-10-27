@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Callable
+
+from astrbot.core.agent.message import AssistantMessageSegment, Message, ToolCallMessageSegment
+from astrbot.core.provider.entities import ToolCallsResult
 
 from .adapter import ACTION_CAPABILITIES, planner_tools, validate_actions, validate_arguments
 from .evidence import EvidenceHooks
 from .phone_observation import PACKAGE, normalize_label
+from .sandbox_agent import compact_results
 
 
 QUERY_CAPABILITIES = frozenset({'sandbox_status', 'phone_status', 'phone_app_scope'})
 REPEATABLE_CAPABILITIES = frozenset({'phone_observe'})
 TARGETED_CAPABILITIES = frozenset({'phone_tap', 'phone_input', 'phone_swipe'})
-SCREENSHOT_DEPENDENT = frozenset({'phone_tap_at'})
 PROTECTED_TARGETS = frozenset({'tv_appbar_title'})
 
 
@@ -62,13 +66,9 @@ You receive one goal and a fixed set of tools. You observe, act, observe again, 
 PERCEPTION
 - phone_observe returns the current screen as a tree of nodes with id, class, text, desc, bounds, clickable.
 - Labels may sit in text or in desc. Both are meaningful; desc is common on custom-rendered pages.
-- If text_available is false, the tree has no labels and no usable ids. Call phone_screenshot and work from
-  the image; tapping by id or text on such a screen is guessing and will fail.
-- After a screenshot you may call phone_tap_at with pixel coordinates read from the image. The screenshot is
-  720x1280; the app area ends at y=1184, below that is the navigation bar. phone_tap_at without a screenshot
-  in the same task returns screenshot_required and does nothing.
-- A screenshot is attached to your next turn as an image when vision is available. When it is not, the call
-  returns only a file path you cannot read, so do not use it to inspect a screen.
+- If text_available is false the tree has no labels and no usable ids. You have no image channel, so stop and
+  report the screen as unreadable instead of guessing a control name.
+- Do not call phone_screenshot or phone_tap_at. They cannot help you read a screen.
 - The tree is the output of adb uiautomator, so it reflects the screen at capture time, not now.
 
 ACTING
@@ -79,8 +79,8 @@ ACTING
   unchanged, never rewrite, extend or shorten it, never add punctuation or mentions.
 - If a call returns unknown_target, protected_control or observe_first, nothing happened on the phone.
   Observe again or choose a different control; do not repeat the same call.
-- missing_or_ambiguous_target means the id matches several rows. Use match=text with that row's label, or take a
-  screenshot and use phone_tap_at. Never repeat the same id and expect a different result.
+- missing_or_ambiguous_target means the id matches several rows. Use match=text with that row's label, or
+  request phone_back and approach the screen another way. Never repeat the same id and expect a new result.
 
 KNOWN LAYOUT OF THIS APP
 - MainActivity: bottom navigation. The middle plus button opens the post editor directly.
@@ -140,10 +140,16 @@ class IndependentExecution:
         self.sanitize_text = sanitize_text
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def tool_message(call_id: str, payload: dict) -> ToolCallMessageSegment:
+        return ToolCallMessageSegment(
+            tool_call_id=call_id, content=json.dumps(payload, ensure_ascii=False, default=str),
+        )
+
     async def run(
         self, *, context, provider_id: str, goal: str, actions: tuple[str, ...], backend,
         max_steps: int = 4, tool_call_timeout: int = 30, frozen: dict | None = None,
-        vision: bool = False,
+        time_budget: float | None = None,
     ) -> dict:
         actions = validate_actions(list(actions), list(actions))
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 4000:
@@ -154,6 +160,7 @@ class IndependentExecution:
             raise ValueError('invalid_step_limit')
         if type(tool_call_timeout) is not int or not 1 <= tool_call_timeout <= 60:
             raise ValueError('invalid_tool_timeout')
+        deadline = None if time_budget is None else time.monotonic() + time_budget
         frozen = dict(frozen or {})
         supplied = {
             key: 'frozen by host; request unchanged'
@@ -169,26 +176,27 @@ class IndependentExecution:
             stalled = False
             status = 'needs_parent'
             reason = 'no_tool_observation'
-            messages = []
+            messages = [Message(role='user', content=json.dumps({
+                'instruction': goal, 'permitted_actions': list(actions), 'host_supplied': supplied,
+            }, ensure_ascii=False))]
             rounds = 0
             hooks.append('task_created', goal=goal, permitted_actions=list(actions))
             try:
                 for rounds in range(1, max_steps + 1):
-                    images = list(getattr(backend, 'images', []) or []) if vision else []
+                    left = None if deadline is None else deadline - time.monotonic()
+                    if left is not None and left <= 15:
+                        status, reason = 'observations_returned' if observations else 'needs_parent', 'time_budget'
+                        break
                     response = await asyncio.wait_for(context.llm_generate(
-                        chat_provider_id=provider_id, prompt=json.dumps({
-                            'instruction': goal, 'permitted_actions': list(actions),
-                            'host_supplied': supplied,
-                            'screen_image_attached': bool(images),
-                            'recent_observations': observations[-6:],
-                            'actions_taken': shown_receipts(receipts),
-                        }, ensure_ascii=False),
-                        system_prompt=EXECUTION_PROTOCOL, contexts=messages,
-                        tools=planner_tools(actions), image_urls=images or None,
-                    ), timeout=60)
+                        chat_provider_id=provider_id, contexts=messages,
+                        system_prompt=EXECUTION_PROTOCOL, tools=planner_tools(actions),
+                    ), timeout=min(60, left) if left else 60)
                     names = response.tools_call_name
                     arguments = response.tools_call_args
-                    if not isinstance(names, list) or not isinstance(arguments, list) or len(names) != len(arguments):
+                    call_ids = getattr(response, 'tools_call_ids', None) or []
+                    if not isinstance(names, list) or not isinstance(arguments, list) or (
+                        len(names) != len(arguments) or len(names) != len(call_ids)
+                    ):
                         raise ValueError('invalid_planner_tool_calls')
                     if not names:
                         status = 'observations_returned' if observations else 'needs_parent'
@@ -212,37 +220,36 @@ class IndependentExecution:
                         status, reason = 'rejected', 'arguments_outside_contract'
                         hooks.append('request_rejected', reason=reason)
                         break
-                    for name, args in validated:
+                    results = []
+                    for (name, args), call_id in zip(validated, call_ids):
                         signature = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
                         if signature == last_call and name not in REPEATABLE_CAPABILITIES:
                             status = 'observations_returned' if observations else 'needs_parent'
                             reason = 'stalled_repeat'
                             stalled = True
+                            results.append(self.tool_message(call_id, {'error': 'stalled_repeat'}))
                             break
                         tree = latest_tree(observations)
-                        if name in SCREENSHOT_DEPENDENT and not (vision and getattr(backend, 'images', None)):
-                            safe = hooks._safe({'error': 'screenshot_required'})
-                            hooks.append('capability_end', capability=name, observation=safe)
-                            observations.append({'capability': name, 'source': 'tool', 'result': safe})
-                            last_call = signature
-                            continue
                         if name in TARGETED_CAPABILITIES and tree is None:
                             safe = hooks._safe({'error': 'observe_first'})
                             hooks.append('capability_end', capability=name, observation=safe)
                             observations.append({'capability': name, 'source': 'tool', 'result': safe})
                             last_call = signature
+                            results.append(self.tool_message(call_id, safe))
                             continue
                         if targets_protected_control(name, args):
                             safe = hooks._safe({'error': 'protected_control', 'target': args.get('target')})
                             hooks.append('capability_end', capability=name, observation=safe)
                             observations.append({'capability': name, 'source': 'tool', 'result': safe})
                             last_call = signature
+                            results.append(self.tool_message(call_id, safe))
                             continue
                         if name in TARGETED_CAPABILITIES and tree is not None and not target_is_visible(tree, name, args):
                             safe = hooks._safe({'error': 'unknown_target', 'target': args.get('target')})
                             hooks.append('capability_end', capability=name, observation=safe)
                             observations.append({'capability': name, 'source': 'tool', 'result': safe})
                             last_call = signature
+                            results.append(self.tool_message(call_id, safe))
                             continue
                         hooks.append('capability_start', capability=name, arguments=args)
                         try:
@@ -255,15 +262,23 @@ class IndependentExecution:
                             hooks.append('capability_end', capability=name, observation=safe)
                             observations.append({'capability': name, 'source': 'tool', 'result': safe})
                             last_call = signature
+                            results.append(self.tool_message(call_id, safe))
                             continue
                         safe = hooks._safe(observation)
                         hooks.append('capability_end', capability=name, observation=safe)
-                        record = {'capability': name, 'source': 'tool', 'result': safe}
-                        observations.append(record)
+                        observations.append({'capability': name, 'source': 'tool', 'result': safe})
                         executed.add(name)
                         last_call = signature
                         if name in ACTION_CAPABILITIES:
                             receipts.append({'capability': name, 'result': safe})
+                        results.append(self.tool_message(call_id, safe))
+                    messages.extend(ToolCallsResult(
+                        tool_calls_info=AssistantMessageSegment(
+                            tool_calls=response.to_openai_tool_calls_model(), content=None,
+                        ),
+                        tool_calls_result=results,
+                    ).to_openai_messages_model())
+                    compact_results(messages)
                     if stalled:
                         break
                     if set(actions) <= QUERY_CAPABILITIES and executed == set(actions):
