@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import shlex
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,11 +79,11 @@ TOOLS ON THIS MACHINE
 - Reading a frozen file once is enough. The host wrote it; do not re-read or re-encode it to check it.
 
 HARD RULES
-- Anything you type that a stranger could read must come from /tmp/operation-frozen.txt, byte for byte.
-  Never compose, translate, extend, shorten or punctuate it yourself. If that file does not exist,
-  you may not type any outward text.
+- Anything you type that a stranger could read must come from frozen_text_file or frozen_files in the task
+  payload, byte for byte. Never compose, translate, extend, shorten or punctuate it yourself.
+  Without a supplied frozen file, you may not type any outward text.
 - Never publish, comment, like, follow, delete or message anyone unless the goal explicitly says to and
-  the text comes from the frozen file.
+  any outward text comes from the supplied frozen files.
 - Never touch QQ, never read credentials, never print tokens or passwords.
 - Do not install packages, change system settings or clear app data.
 - Do not start background processes.
@@ -111,7 +112,7 @@ WORKSPACE
 - You have a shell. Use cat, ls, sed, python3, base64 as needed.
 
 WRITING TEXT SHE GAVE YOU
-- When she supplies text for you to store, it is written to /tmp/operation-frozen.txt.
+- When she supplies text for you to store, read its path from frozen_text_file in the task payload.
 - Copy it byte for byte into the target file. Do not rephrase, shorten, expand, translate or fix
   punctuation. If the file does not exist, ask rather than invent the content.
 - When the task is to read something back, return the text itself, not a summary of it.
@@ -141,7 +142,6 @@ SHELL_TOOL = FunctionTool(
     },
 )
 
-FROZEN_PATH = '/tmp/operation-frozen.txt'
 MAX_OUTPUT_CHARS = 6000
 MAX_SUMMARY_CHARS = 600
 KEEP_FULL_RESULTS = 8
@@ -193,8 +193,8 @@ def compact_results(messages):
 def last_commands(recent, count=3):
     if not recent:
         return 'No command had run yet.'
-    tail = '; '.join(f'{command[:60]} -> exit {code}' for command, code in recent[-count:])
-    return f'Last commands: {tail}'
+    codes = ', '.join(str(code) for _, code in recent[-count:])
+    return f'{len(recent)} commands ran; recent exit codes: {codes}.'
 
 
 def describe_stop(resolution, recent):
@@ -261,7 +261,7 @@ class SandboxAgent:
         time_budget: float | None = None, protocol: str | None = None,
         needs_device_action: bool = True,
     ) -> dict:
-        if not isinstance(goal, str) or not goal.strip() or len(goal) > 4000:
+        if not isinstance(goal, str) or not goal.strip() or len(goal) > 8000:
             raise ValueError('invalid_goal')
         if type(max_steps) is not int or not 1 <= max_steps <= 40:
             raise ValueError('invalid_step_limit')
@@ -278,6 +278,8 @@ class SandboxAgent:
                 if not isinstance(value, str) or not value:
                     raise ValueError('invalid_frozen_files')
         log = CommandLog(self.evidence_root)
+        frozen_directory = f'/tmp/operation-context/{log.task_id}'
+        frozen_path = f'{frozen_directory}/text.txt' if frozen_text else None
         status, reason, summary = 'step_limit', None, None
         device_actions = 0
         messages = []
@@ -289,26 +291,26 @@ class SandboxAgent:
         recent = []
         stop_reason = None
         try:
+            payloads = {}
             if frozen_text:
-                encoded = base64.b64encode(frozen_text.encode('utf-8')).decode('ascii')
-                setup = await self._shell(
-                    f"printf %s '{encoded}' | base64 -d > {FROZEN_PATH}", 30,
-                )
-                log.append({'kind': 'frozen_text_written', 'exit_code': setup['exit_code'],
-                            'bytes': len(frozen_text)})
-            written = {}
-            for key, value in (frozen_files or {}).items():
-                path = f"/tmp/operation-{key}.txt"
-                encoded = base64.b64encode(value.encode('utf-8')).decode('ascii')
-                setup = await self._shell(f"printf %s '{encoded}' | base64 -d > {path}", 30)
-                written[key] = path
-                log.append({'kind': 'frozen_file_written', 'file': key,
-                            'exit_code': setup['exit_code'], 'bytes': len(value)})
+                payloads[frozen_path] = frozen_text
+            written = {key: f'{frozen_directory}/{key}.txt' for key in (frozen_files or {})}
+            payloads.update({written[key]: value for key, value in (frozen_files or {}).items()})
+            if payloads:
+                commands = [f'mkdir -p /tmp/operation-context && mkdir -m 700 {shlex.quote(frozen_directory)}']
+                for path, value in payloads.items():
+                    encoded = base64.b64encode(value.encode('utf-8')).decode('ascii')
+                    commands.append(f'printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}')
+                setup = await self._shell(' && '.join(commands), 30)
+                log.append({'kind': 'frozen_payload_written', 'exit_code': setup['exit_code'],
+                            'files': list(payloads)})
+                if setup['exit_code'] != 0:
+                    raise RuntimeError('frozen_payload_write_failed')
             if extra_rules:
                 log.append({'kind': 'extra_rules', 'text': extra_rules[:400]})
             messages.append(Message(role='user', content=json.dumps({
                 'goal': goal,
-                'frozen_text_file': FROZEN_PATH if frozen_text else None,
+                'frozen_text_file': frozen_path,
                 'frozen_files': written or None,
                 'task_rules': extra_rules,
             }, ensure_ascii=False)))

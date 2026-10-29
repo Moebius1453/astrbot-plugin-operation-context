@@ -5,7 +5,9 @@ Writes never overwrite silently: replace keeps a timestamped backup first,
 and create refuses to clobber an existing file.
 """
 
+import asyncio
 import base64
+from contextlib import asynccontextmanager
 import json
 import re
 import shlex
@@ -55,7 +57,7 @@ print(json.dumps({'content':base64.b64encode(data).decode('ascii'),'bytes':len(d
 '''
 
 
-_WRITE_SCRIPT = r'''import base64,json,os,time
+_WRITE_SCRIPT = r'''import base64,json,os,time,uuid
 payload=json.loads(PAYLOAD)
 path=payload['path']
 mode=payload['mode']
@@ -67,8 +69,8 @@ exists=os.path.isfile(path)
 backup=None
 if mode=='create' and exists: raise RuntimeError('note_already_exists')
 if mode=='replace' and exists:
-    backup=path+'.bak-'+time.strftime('%Y%m%d-%H%M%S')
-    with open(path,'rb') as src, open(backup,'wb') as dst: dst.write(src.read())
+    backup=path+'.bak-'+time.strftime('%Y%m%d-%H%M%S')+'-'+uuid.uuid4().hex
+    with open(path,'rb') as src, open(backup,'xb') as dst: dst.write(src.read())
 if mode=='append' and exists:
     with open(path,'ab') as f: f.write(data)
 else:
@@ -81,6 +83,46 @@ else:
 with open(path,'rb') as f: written=len(f.read())
 print(json.dumps({'written':True,'bytes':written,'backup':backup,'mode':mode}))
 '''
+
+
+class WorkspaceAccess:
+    def __init__(self):
+        self._condition = asyncio.Condition()
+        self._paths = set()
+        self._worker_active = False
+        self._waiting_workers = 0
+
+    @asynccontextmanager
+    async def note(self, path):
+        target = validate_note_path(path)
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: not self._worker_active and not self._waiting_workers and target not in self._paths
+            )
+            self._paths.add(target)
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._paths.remove(target)
+                self._condition.notify_all()
+
+    @asynccontextmanager
+    async def worker(self):
+        async with self._condition:
+            self._waiting_workers += 1
+            try:
+                await self._condition.wait_for(lambda: not self._worker_active and not self._paths)
+                self._worker_active = True
+            finally:
+                self._waiting_workers -= 1
+                self._condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._worker_active = False
+                self._condition.notify_all()
 
 
 class NoteStore:

@@ -135,7 +135,39 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(shell.commands), 1)
         expected = base64.b64encode('测试评论 @主人'.encode()).decode()
         self.assertIn(expected, shell.commands[0])
-        self.assertIn('/tmp/operation-frozen.txt', shell.commands[0])
+        payload = json.loads(planner.requests[0]['contexts'][0].content)
+        self.assertRegex(payload['frozen_text_file'], r'^/tmp/operation-context/[a-f0-9]{32}/text\.txt$')
+        self.assertIn(payload['frozen_text_file'], shell.commands[0])
+
+    async def test_frozen_paths_are_isolated_per_task(self):
+        paths = []
+        for _ in range(2):
+            planner = Planner([done('好')])
+            shell = Shell()
+            result = await self.run_agent(
+                planner, shell, frozen_text='原文', frozen_files={'title': '标题', 'body': '正文'},
+            )
+            payload = json.loads(planner.requests[0]['contexts'][0].content)
+            directory = f"/tmp/operation-context/{result['task_id']}"
+            self.assertEqual(payload['frozen_text_file'], directory + '/text.txt')
+            self.assertEqual(payload['frozen_files'], {
+                'title': directory + '/title.txt', 'body': directory + '/body.txt',
+            })
+            for path in (payload['frozen_text_file'], *payload['frozen_files'].values()):
+                self.assertIn(path, shell.commands[0])
+            paths.append(payload['frozen_text_file'])
+        self.assertNotEqual(*paths)
+
+    async def test_failed_frozen_setup_never_starts_the_model(self):
+        class FailedSetup:
+            async def call(self, *args, **kwargs):
+                return json.dumps({'exit_code': 1, 'stdout': '', 'stderr': 'write failed'})
+
+        planner = Planner([done('不能执行')])
+        result = await self.run_agent(planner, FailedSetup(), frozen_text='原文')
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('frozen_payload_write_failed', result['summary'])
+        self.assertEqual(planner.requests, [])
 
     async def test_step_limit_stops_without_summary(self):
         planner = Planner([call('echo a') for _ in range(5)])
@@ -188,6 +220,17 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['reason'], 'repeated_command')
         self.assertIn('three times', result['summary'])
         self.assertEqual(result['command_count'], 3)
+        self.assertNotIn('echo same', result['summary'])
+
+    async def test_full_parent_goal_with_preparation_rules_fits(self):
+        from ..app.publish import build_goal
+
+        planner = Planner([done('准备未提交')])
+        result = await SandboxAgent(Shell(), None, self.root).run(
+            context=planner, provider_id='p', goal=build_goal('目' * 4000, None, None),
+        )
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('目' * 4000, planner.requests[0]['contexts'][0].content)
 
     async def test_idle_rounds_before_the_first_action_are_tolerated(self):
         planner = Planner([call('echo a'), call('echo b'), call('echo c'), done('看完了。')])

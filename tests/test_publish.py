@@ -1,6 +1,6 @@
 import unittest
 
-from ..app.publish import DELETE_RULES, PREPARE_RULES, build_goal, validate_publish
+from ..app.publish import COMMENT_RULES, DELETE_RULES, PREPARE_RULES, build_comment_goal, build_goal, validate_publish
 
 
 class PublishRequestTests(unittest.TestCase):
@@ -31,17 +31,26 @@ class PublishRequestTests(unittest.TestCase):
 
 class GoalTests(unittest.TestCase):
     def test_goal_states_frozen_files_and_stop_rule(self):
-        goal = build_goal(None, None)
-        self.assertIn('/tmp/operation-title.txt', goal)
-        self.assertIn('/tmp/operation-body.txt', goal)
+        goal = build_goal('按我指定的话题发帖', None, None)
+        self.assertIn('按我指定的话题发帖', goal)
+        self.assertIn('frozen_files.title', goal)
+        self.assertIn('frozen_files.body', goal)
         self.assertIn('stop', goal)
 
     def test_goal_mentions_native_picker(self):
-        goal = build_goal(None, 'cannot_view')
+        goal = build_goal('发帖', None, 'cannot_view')
         self.assertIn('cannot_view', goal)
         self.assertIn('native mention picker', goal)
 
     def test_rules_forbid_final_submit(self):
         self.assertIn('stop before pressing', PREPARE_RULES)
         self.assertIn('Do not tap', PREPARE_RULES)
-        self.assertIn('operation-target.txt', DELETE_RULES)
+        self.assertIn('frozen_files.target', DELETE_RULES)
+
+    def test_comment_goal_keeps_target_and_frozen_content_rules(self):
+        goal = build_comment_goal('打开标题为星空的帖子，回复作者的第二条评论', 'cannot_view')
+        self.assertIn('打开标题为星空的帖子，回复作者的第二条评论', goal)
+        self.assertIn('frozen_text_file', goal)
+        self.assertIn('native mention picker', goal)
+        self.assertIn('Do not send', goal)
+        self.assertIn('host performs the final send', COMMENT_RULES)

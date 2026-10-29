@@ -11,7 +11,7 @@ THIS TASK IS PREPARATION ONLY
 
 DELETE_RULES = '''
 THIS TASK IS A DELETION
-- The post to remove is identified by the exact title in /tmp/operation-target.txt.
+- The post to remove is identified by the exact title in frozen_files.target from the task payload.
 - Open your own profile, find the post whose title matches that file byte for byte, open its menu and delete it.
 - If more than one post matches, stop and say so instead of guessing.
 - Confirm the deletion dialog, then check the post is gone and report what you saw.
@@ -21,7 +21,7 @@ COMMENT_RULES = '''
 THIS TASK IS PREPARATION ONLY
 - Open the comment box on the post the parent named and type the frozen text into it.
 - Do not tap 发送 or any other send control. The host performs the final send.
-- The text comes from /tmp/operation-frozen.txt. Use it byte for byte.
+- The text comes from frozen_text_file in the task payload. Use it byte for byte.
 - Report in your final sentence what is now in the comment box.
 '''
 
@@ -56,10 +56,11 @@ def validate_publish(title, text, images, mention):
             raise ValueError('invalid_post_mention')
 
 
-def build_comment_goal(mention):
+def build_comment_goal(goal, mention):
     parts = [
-        'Open the comment box on the post the parent named and type the frozen text into it, then stop.',
-        'The text is in /tmp/operation-frozen.txt. Type it exactly; do not translate, shorten, add or remove punctuation.',
+        goal,
+        'Open the comment box on the target post described above and type the frozen text into it, then stop.',
+        'Read the exact text from frozen_text_file in the task payload; do not translate, shorten, add or remove punctuation.',
     ]
     if mention:
         parts.append(
@@ -70,10 +71,11 @@ def build_comment_goal(mention):
     return ' '.join(parts)
 
 
-def build_goal(images, mention):
+def build_goal(goal, images, mention):
     parts = [
+        goal,
         'Open the post editor for a normal text post (type 内容) and prepare it, then stop.',
-        'The title is in /tmp/operation-title.txt and the body in /tmp/operation-body.txt.',
+        'The title and body paths are frozen_files.title and frozen_files.body in the task payload.',
         'Type them exactly; do not translate, shorten, add or remove punctuation.',
     ]
     if images:

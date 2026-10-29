@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from astrbot.api import logger
@@ -11,7 +12,7 @@ from .app.comment_submit import CommentSubmitter, validate_comment
 from .app.event_ledger import EventLedger
 from .app.execution import IndependentExecution
 from .app.notification_poll import NotificationPoller, fetch_notifications, record_dump
-from .app.note_store import NoteStore, validate_content, validate_mode, validate_note_path
+from .app.note_store import NoteStore, WorkspaceAccess, validate_content, validate_mode, validate_note_path
 from .app.post_submit import PostSubmitter, validate_post
 from .app.publish import (
     COMMENT_RULES, DELETE_RULES, PREPARE_RULES, build_comment_goal, build_goal, validate_publish,
@@ -117,6 +118,7 @@ class OperationContextPlugin(Star):
         self.ledger = None
         self.poller = None
         self.phone_busy = False
+        self.workspace_access = WorkspaceAccess()
         self.context.add_llm_tools(OperationTool(self))
 
     async def initialize(self) -> None:
@@ -154,42 +156,88 @@ class OperationContextPlugin(Star):
         yield event.plain_result('已请求停止，执行器会在下一轮开始时收手，把已完成的部分交回来。')
 
     async def execute(self, run_context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None, note_path: str | None = None, note_mode: str | None = None) -> str:
-        if self.phone_busy:
-            return json.dumps({
-                'status': 'busy', 'reason': 'another_phone_task_running',
-                'needs_parent': True, 'external_action_status': 'not_attempted',
-            })
-        self.phone_busy = True
+        owns_phone = False
         try:
+            if not isinstance(goal, str) or not goal.strip() or len(goal) > 4000:
+                raise ValueError('invalid_goal')
+            permitted, outward = resolve_actions(actions, self.config.get('allowed_capabilities', []))
+            needs_phone = bool(set(permitted) - {
+                'sandbox_status', 'phone_events', 'note_read', 'note_write', 'sandbox_worker',
+            })
+            if needs_phone:
+                if self.phone_busy:
+                    return json.dumps({
+                        'status': 'busy', 'reason': 'another_phone_task_running',
+                        'needs_parent': True, 'external_action_status': 'not_attempted',
+                    })
+                self.phone_busy = owns_phone = True
             return await self._dispatch(
-                run_context, goal, actions, input_text, expect_text,
+                run_context, goal, permitted, outward, input_text, expect_text,
                 post_title, post_text, post_images, post_mention, note_path, note_mode,
             )
+        except ValueError as exc:
+            reason = str(exc).partition(':')[0]
+            known = {
+                'invalid_goal', 'actions_must_be_nonempty_list_up_to_four',
+                'invalid_capability_configuration', 'capability_not_authorized',
+                'duplicate_action', 'standalone_capability_must_be_alone',
+                'sandbox_runtime_required', 'shipyard_neo_required',
+                'parent_shell_permission_required', 'trusted_shell_backend_unavailable',
+                'unexpected_note_fields', 'unexpected_text_fields', 'invalid_input_text',
+                'invalid_post_title', 'invalid_post_text', 'invalid_post_images',
+                'invalid_post_image_path', 'invalid_post_mention', 'post_images_disabled',
+                'invalid_post_payload', 'invalid_comment_text', 'ledger_disabled',
+                'unexpected_input_text', 'unexpected_post_fields', 'input_text_required',
+                'invalid_expect_text', 'invalid_note_path', 'note_path_outside_allowed_dirs',
+                'invalid_note_mode', 'invalid_note_content', 'note_read_failed', 'note_write_failed',
+            }
+            if reason not in known:
+                reason = 'invalid_request'
+            return json.dumps({
+                'status': 'rejected', 'needs_parent': True, 'reason': reason,
+                'error_type': type(exc).__name__, 'external_action_status': 'unknown',
+            })
+        except TimeoutError:
+            return json.dumps({
+                'status': 'failed', 'needs_parent': True, 'reason': 'operation_timed_out',
+                'error_type': 'TimeoutError', 'external_action_status': 'unknown',
+            })
+        except Exception as exc:
+            logger.warning('Operation failed: %s', type(exc).__name__)
+            return json.dumps({
+                'status': 'failed', 'needs_parent': True, 'reason': 'execution_failed',
+                'error_type': type(exc).__name__, 'external_action_status': 'unknown',
+            })
         finally:
-            self.phone_busy = False
+            if owns_phone:
+                self.phone_busy = False
 
-    async def _dispatch(self, run_context, goal, actions, input_text, expect_text, post_title, post_text, post_images, post_mention, note_path, note_mode) -> str:
-        try:
-            permitted, outward = resolve_actions(actions, self.config.get('allowed_capabilities', []))
-            event = run_context.context.event
-            settings = self.context.get_config(umo=event.unified_msg_origin).get('provider_settings', {})
-            limit = settings.get('tool_call_timeout')
-            time_budget = max(30, float(limit) - 10) if isinstance(limit, (int, float)) else 110.0
-            request = TaskRequest(
-                run_context=run_context, shell=build_backend(run_context, self.context, event.get_extra(SNAPSHOT_KEY)),
-                goal=goal, permitted=permitted, input_text=input_text, expect_text=expect_text,
-                post_title=post_title, post_text=post_text, post_images=post_images, post_mention=post_mention,
-                note_path=note_path, note_mode=note_mode,
-                time_budget=time_budget,
-            )
+    async def _dispatch(self, run_context, goal, permitted, outward, input_text, expect_text, post_title, post_text, post_images, post_mention, note_path, note_mode) -> str:
+        event = run_context.context.event
+        settings = self.context.get_config(umo=event.unified_msg_origin).get('provider_settings', {})
+        limit = settings.get('tool_call_timeout')
+        time_budget = max(30, float(limit) - 10) if isinstance(limit, (int, float)) else 110.0
+        request = TaskRequest(
+            run_context=run_context, shell=build_backend(run_context, self.context, event.get_extra(SNAPSHOT_KEY)),
+            goal=goal, permitted=permitted, input_text=input_text, expect_text=expect_text,
+            post_title=post_title, post_text=post_text, post_images=post_images, post_mention=post_mention,
+            note_path=note_path, note_mode=note_mode,
+            time_budget=time_budget,
+        )
+        deadline = asyncio.get_running_loop().time() + time_budget
+        async with asyncio.timeout(time_budget):
+            if outward == 'sandbox_worker':
+                async with self.workspace_access.worker():
+                    request.time_budget = deadline - asyncio.get_running_loop().time()
+                    return await self.standalone_handlers[outward](request)
+            if outward in ('note_read', 'note_write'):
+                async with self.workspace_access.note(note_path):
+                    return await self.standalone_handlers[outward](request)
             if outward is not None:
                 return await self.standalone_handlers[outward](request)
             if note_path is not None or note_mode is not None:
                 raise ValueError('unexpected_note_fields')
             return await self.run_fixed(request)
-        except Exception as exc:
-            logger.warning('Restricted operation rejected or failed: %s', type(exc).__name__)
-            return json.dumps({'status': 'rejected', 'needs_parent': True, 'error_type': type(exc).__name__, 'external_action_status': 'not_attempted'})
 
     async def provider_id(self, event) -> str:
         configured = self.config.get('executor_provider')
@@ -244,7 +292,7 @@ class OperationContextPlugin(Star):
             raise ValueError('unexpected_text_fields')
         validate_publish(request.post_title, request.post_text, request.post_images, request.post_mention)
         preparation = await self.run_agent(
-            request, build_goal(request.post_images, request.post_mention),
+            request, build_goal(request.goal, request.post_images, request.post_mention),
             frozen_files={'title': request.post_title, 'body': request.post_text},
             extra_rules=PREPARE_RULES,
         )
@@ -267,7 +315,7 @@ class OperationContextPlugin(Star):
         if not isinstance(request.post_title, str) or not request.post_title.strip() or len(request.post_title) > 100:
             raise ValueError('invalid_post_title')
         result = await self.run_agent(
-            request, 'Delete one of your own posts. The exact title is in /tmp/operation-target.txt.',
+            request, request.goal + '\nDelete one of your own posts. Read its exact title from frozen_files.target in the task payload.',
             frozen_files={'target': request.post_title}, extra_rules=DELETE_RULES,
         )
         return json.dumps(result, ensure_ascii=False)
@@ -286,7 +334,7 @@ class OperationContextPlugin(Star):
             raise ValueError('unexpected_text_fields')
         validate_comment(request.input_text)
         preparation = await self.run_agent(
-            request, build_comment_goal(request.post_mention),
+            request, build_comment_goal(request.goal, request.post_mention),
             frozen_text=request.input_text, extra_rules=COMMENT_RULES,
         )
         result = {
