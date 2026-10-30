@@ -19,6 +19,11 @@
     "type": "string",
     "default": ""
   },
+  "background_task_timeout": {
+    "description": "后台自由执行任务（phone_agent、sandbox_worker）的总预算秒数，60至3600，默认900。任务在后台运行，结束后把短结果报回主对话；手机仍一次只允许一个任务",
+    "type": "int",
+    "default": 900
+  },
   "ledger_enabled": {
     "description": "是否定期读取手机通知并记入事件账本。只读，不打开App，不改变通知状态",
     "type": "bool",

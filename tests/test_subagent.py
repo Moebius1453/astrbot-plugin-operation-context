@@ -29,7 +29,7 @@ class Planner:
         self.requests = []
 
     async def llm_generate(self, **kwargs):
-        self.requests.append(kwargs)
+        self.requests.append({**kwargs, 'contexts': list(kwargs['contexts'])})
         return self.responses.pop(0) if self.responses else Response(text='')
 
 
@@ -169,13 +169,25 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('frozen_payload_write_failed', result['summary'])
         self.assertEqual(planner.requests, [])
 
-    async def test_step_limit_stops_without_summary(self):
+    async def test_step_limit_keeps_an_explicit_unfinished_result(self):
         planner = Planner([call('echo a') for _ in range(5)])
         shell = Shell()
         result = await self.run_agent(planner, shell, max_steps=2)
         self.assertEqual(result['status'], 'step_limit')
         self.assertEqual(result['command_count'], 2)
-        self.assertIsNone(result['summary'])
+        self.assertEqual(result['reason'], 'step_limit')
+        self.assertIn('2 commands ran', result['summary'])
+        self.assertIn('No final conclusion', result['summary'])
+        self.assertNotIn('echo a', result['summary'])
+        self.assertEqual(len(planner.requests), 2)
+
+    async def test_empty_final_response_is_not_completed(self):
+        planner = Planner([done('   ')])
+        result = await self.run_agent(planner, Shell())
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'empty_final_response')
+        self.assertTrue(result['summary'])
+        self.assertEqual(len(planner.requests), 1)
 
     async def test_blocked_commands_never_reach_the_shell(self):
         planner = Planner([call('pm clear com.max.xiaoheihe'), done('被拦下了。')])
@@ -206,7 +218,7 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         commands = [f'/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input tap {index} 1'
                     for index in range(12)]
         planner = Planner([call(command) for command in commands] + [done('完')])
-        result = await self.run_agent(planner, Verbose(), max_steps=20)
+        result = await self.run_agent(planner, Verbose(), max_steps=20, needs_device_action=False)
         self.assertEqual(result['status'], 'completed')
         texts = [message.content for message in planner.requests[-1]['contexts'] if message.role == 'tool']
         self.assertEqual(len(texts), 12)
@@ -248,20 +260,89 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertIn('Do not touch the phone', planner.requests[0]['system_prompt'])
 
-    async def test_eight_rounds_without_any_action_give_up(self):
-        planner = Planner([call(f'echo {index}') for index in range(12)])
-        result = await self.run_agent(planner, Shell())
-        self.assertEqual(result['status'], 'needs_parent')
-        self.assertEqual(result['reason'], 'no_action_ever')
+    async def test_read_only_exploration_with_new_output_is_not_stopped(self):
+        class Changing:
+            def __init__(self):
+                self.count = 0
+
+            async def call(self, run_context, command, background=False, timeout=None):
+                self.count += 1
+                return json.dumps({'exit_code': 0, 'stdout': f'page {self.count}', 'stderr': ''})
+
+        planner = Planner(
+            [call(f'cat page{index}') for index in range(12)] + [done('看完了。')],
+        )
+        result = await self.run_agent(planner, Changing())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['command_count'], 12)
         self.assertEqual(result['device_action_count'], 0)
 
-    async def test_three_idle_rounds_after_acting_give_up(self):
+    async def test_same_command_with_new_output_is_not_a_repeat(self):
+        class Changing:
+            def __init__(self):
+                self.count = 0
+
+            async def call(self, run_context, command, background=False, timeout=None):
+                self.count += 1
+                return json.dumps({'exit_code': 0, 'stdout': f'frame {self.count}', 'stderr': ''})
+
+        planner = Planner(
+            [call('adb shell uiautomator dump') for _ in range(5)] + [done('好。')],
+        )
+        result = await self.run_agent(planner, Changing())
+        self.assertEqual(result['status'], 'completed')
+
+    async def test_six_identical_rounds_after_acting_give_up(self):
         tap = '/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input tap 1 1'
-        planner = Planner([call(tap), call('echo a'), call('echo b'), call('echo c'), call('echo d')])
+        planner = Planner([call(tap)] + [call(f'cat page{index}') for index in range(9)])
         result = await self.run_agent(planner, Shell())
         self.assertEqual(result['status'], 'needs_parent')
         self.assertEqual(result['reason'], 'no_progress')
         self.assertEqual(result['device_action_count'], 1)
+        self.assertEqual(result['command_count'], 7)
+
+    async def test_unchanged_observations_stop_even_when_actions_run(self):
+        commands = [
+            f'/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 shell input swipe '
+            f'360 {900 + index} 360 400 300; cat /tmp/page'
+            for index in range(9)
+        ]
+        shell = Shell({command: {'exit_code': 0, 'stdout': 'same page', 'stderr': ''}
+                       for command in commands})
+        result = await self.run_agent(Planner([call(command) for command in commands]), shell)
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'no_progress')
+        self.assertEqual(result['command_count'], 7)
+        self.assertEqual(result['device_action_count'], 7)
+
+    async def test_empty_action_receipts_do_not_reset_unchanged_observations(self):
+        responses, outputs = [], {}
+        for index in range(9):
+            action = (
+                '/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 '
+                f'shell input tap {index} 1'
+            )
+            observation = f'cat /tmp/page{index}'
+            responses.extend([call(action), call(observation)])
+            outputs[action] = {'exit_code': 0, 'stdout': '', 'stderr': ''}
+            outputs[observation] = {'exit_code': 0, 'stdout': 'same page', 'stderr': ''}
+        result = await self.run_agent(Planner(responses), Shell(outputs))
+        self.assertEqual(result['status'], 'needs_parent')
+        self.assertEqual(result['reason'], 'no_progress')
+        self.assertEqual(result['command_count'], 14)
+
+    async def test_changed_observations_reset_stagnation_after_actions(self):
+        responses, outputs = [], {}
+        for index in range(12):
+            command = (
+                '/workspace/.local/adbdl/platform-tools/adb -s 172.22.0.2:5555 '
+                f'shell input tap {index} 1; cat /tmp/page'
+            )
+            responses.append(call(command))
+            outputs[command] = {'exit_code': 0, 'stdout': f'page {index // 4}', 'stderr': ''}
+        result = await self.run_agent(Planner(responses + [done('看完了。')]), Shell(outputs))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['command_count'], 12)
 
     async def test_three_failed_commands_give_up(self):
         class Failing:
@@ -291,7 +372,75 @@ class SandboxAgentTests(unittest.IsolatedAsyncioTestCase):
         planner = Planner([call('echo a')])
         result = await self.run_agent(planner, Shell(), time_budget=0)
         self.assertEqual(result['status'], 'time_budget')
+        self.assertEqual(result['reason'], 'time_budget')
+        self.assertIn('No final conclusion', result['summary'])
         self.assertEqual(planner.requests, [])
+
+    async def test_rejected_tool_keeps_an_explicit_result(self):
+        result = await self.run_agent(Planner([Response(['unknown_tool'], [{}])]), Shell())
+        self.assertEqual(result['status'], 'rejected')
+        self.assertTrue(result['reason'])
+        self.assertTrue(result['summary'])
+
+    async def test_work_context_is_saved_between_runs(self):
+        from ..app.work_context import WorkContext
+
+        work = WorkContext(self.root / 'work_contexts', 'task-1')
+        planner = Planner([call('echo a'), done('好了。')])
+        await self.run_agent(planner, Shell(), work_context=work)
+        saved = work.load()
+        roles = [item['role'] for item in saved]
+        self.assertEqual(roles[0], 'user')
+        self.assertIn('tool', roles)
+        self.assertEqual(saved[-1]['role'], 'assistant')
+        self.assertEqual(saved[-1]['content'], '好了。')
+
+        resumed = Planner([call('echo next'), done('接着做完了。')])
+        shell = Shell()
+        result = await self.run_agent(resumed, shell, resume=saved, work_context=work)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(shell.commands, ['echo next'])
+        self.assertEqual(len(resumed.requests), 2)
+        seen = resumed.requests[0]['contexts']
+        self.assertEqual(len(seen), len(saved) + 1)
+        self.assertEqual(seen[0].role, 'user')
+        self.assertTrue(all(hasattr(message, 'role') for message in seen))
+        self.assertEqual(work.load()[-1]['content'], '接着做完了。')
+
+    async def test_resumed_history_can_compact_old_tool_results(self):
+        from ..app.work_context import WorkContext
+
+        work = WorkContext(self.root / 'work_contexts', 'task-long')
+        commands = [f'echo {index}' for index in range(10)]
+        shell = Shell({command: {'exit_code': 0, 'stdout': 'x' * 800, 'stderr': ''}
+                       for command in commands})
+        first = await self.run_agent(
+            Planner([call(command) for command in commands] + [done('上一轮结束。')]),
+            shell, work_context=work, needs_device_action=False,
+        )
+        self.assertEqual(first['status'], 'completed')
+        resumed = Planner([call('echo next'), done('接续结束。')])
+        result = await self.run_agent(
+            resumed, Shell(), resume=work.load(), work_context=work,
+        )
+        self.assertEqual(result['status'], 'completed')
+        tools = [message for message in resumed.requests[1]['contexts'] if message.role == 'tool']
+        self.assertEqual(len(tools), 11)
+        self.assertIn('older result compacted', tools[0].content)
+
+    async def test_followups_are_inserted_before_the_next_round(self):
+        pending = ['顺便看一下电量']
+
+        def take_followups():
+            return pending.pop(0) if pending else []
+
+        planner = Planner([call('echo a'), done('好。')])
+        await self.run_agent(planner, Shell(), take_followups=take_followups)
+        contents = [
+            message.content for message in planner.requests[1]['contexts']
+            if getattr(message, 'role', None) == 'user'
+        ]
+        self.assertTrue(any('运行中补充要求' in str(content) for content in contents))
 
     async def test_limits_are_validated(self):
         for kwargs in ({'max_steps': 0}, {'max_steps': 41}, {'max_steps': True}, {'goal': ''}):

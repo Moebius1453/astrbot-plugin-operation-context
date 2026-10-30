@@ -147,8 +147,7 @@ MAX_SUMMARY_CHARS = 600
 KEEP_FULL_RESULTS = 8
 COMPACT_CHARS = 400
 MAX_REPEATS = 3
-MAX_IDLE_ROUNDS = 3
-MAX_IDLE_BEFORE_ACTION = 8
+MAX_IDLE_ROUNDS = 6
 MAX_FAILED_COMMANDS = 3
 
 # A stop request only applies to tasks that started before it was issued, so a
@@ -199,10 +198,14 @@ def last_commands(recent, count=3):
 
 def describe_stop(resolution, recent):
     lead = {
-        'repeated_command': 'Stopped: the same command ran three times.',
+        'repeated_command': 'Stopped: the same command returned the same output three times.',
         'repeated_command_failure': 'Stopped: three commands failed in a row.',
-        'no_progress': 'Stopped: three rounds in a row made no change to the phone.',
-        'no_action_ever': 'Stopped: eight rounds passed without a single action on the phone.',
+        'no_progress': 'Stopped: several rounds in a row observed exactly the same thing.',
+        'step_limit': 'Stopped: the step limit was reached. No final conclusion was produced; the outcome remains unconfirmed.',
+        'time_budget': 'Stopped: the time budget was reached. No final conclusion was produced; the outcome remains unconfirmed.',
+        'empty_final_response': 'The executor returned no final conclusion; the outcome remains unconfirmed.',
+        'invalid_tool_call': 'Stopped: the executor requested an invalid tool call; the outcome remains unconfirmed.',
+        'invalid_command': 'Stopped: the executor supplied an invalid command; the outcome remains unconfirmed.',
     }.get(resolution, 'Stopped.')
     return (lead + ' ' + last_commands(recent))[:MAX_SUMMARY_CHARS]
 
@@ -259,7 +262,8 @@ class SandboxAgent:
         command_timeout: int = 60, frozen_text: str | None = None,
         frozen_files: dict | None = None, extra_rules: str | None = None,
         time_budget: float | None = None, protocol: str | None = None,
-        needs_device_action: bool = True,
+        needs_device_action: bool = True, resume: list[dict] | None = None,
+        work_context=None, take_followups=None,
     ) -> dict:
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 8000:
             raise ValueError('invalid_goal')
@@ -282,12 +286,15 @@ class SandboxAgent:
         frozen_path = f'{frozen_directory}/text.txt' if frozen_text else None
         status, reason, summary = 'step_limit', None, None
         device_actions = 0
-        messages = []
+        messages = [Message.model_validate(message) for message in (resume or [])]
+        if resume:
+            log.append({'kind': 'resumed', 'messages': len(resume)})
         started_at = time.monotonic()
         idle_rounds = 0
-        has_acted = False
         failure_streak = 0
         command_counts = {}
+        command_signatures = {}
+        previous_round = None
         recent = []
         stop_reason = None
         try:
@@ -315,7 +322,7 @@ class SandboxAgent:
                 'task_rules': extra_rules,
             }, ensure_ascii=False)))
             for _ in range(max_steps):
-                round_actions = device_actions
+                round_records = []
                 if stop_requested_since(started_at):
                     status, reason = 'stopped', 'parent_requested_stop'
                     summary = 'Stopped at the request of the host. ' + last_commands(recent)
@@ -326,6 +333,13 @@ class SandboxAgent:
                     status, summary = 'time_budget', None
                     log.append({'kind': 'time_budget', 'remaining': round(left, 1)})
                     break
+                if take_followups is not None:
+                    for followup in take_followups():
+                        messages.append(Message(
+                            role='user',
+                            content='【运行中补充要求】\n' + followup,
+                        ))
+                        log.append({'kind': 'followup_consumed', 'chars': len(followup)})
                 response = await asyncio.wait_for(
                     context.llm_generate(
                         chat_provider_id=provider_id,
@@ -339,13 +353,18 @@ class SandboxAgent:
                 arguments = getattr(response, 'tools_call_args', None) or []
                 call_ids = getattr(response, 'tools_call_ids', None) or []
                 if not names:
-                    summary = (getattr(response, 'completion_text', '') or '').strip()[:MAX_SUMMARY_CHARS] or None
-                    status = 'completed'
+                    final_text = (getattr(response, 'completion_text', '') or '').strip()
+                    if final_text:
+                        messages.append(Message(role='assistant', content=final_text))
+                        summary = final_text[:MAX_SUMMARY_CHARS]
+                        status = 'completed'
+                    else:
+                        status, reason = 'needs_parent', 'empty_final_response'
                     break
                 if len(names) > 4 or len(names) != len(arguments) or len(names) != len(call_ids) or any(
                     not isinstance(name, str) or name != 'sandbox_shell' for name in names
                 ):
-                    status = 'rejected'
+                    status, reason = 'rejected', 'invalid_tool_call'
                     log.append({'kind': 'rejected', 'names': names})
                     break
                 rejected = False
@@ -353,13 +372,14 @@ class SandboxAgent:
                 for argument, call_id in zip(arguments, call_ids):
                     command = argument.get('command') if isinstance(argument, dict) else None
                     if not isinstance(command, str) or not command.strip() or len(command) > 2000:
-                        status, rejected = 'rejected', True
+                        status, reason, rejected = 'rejected', 'invalid_command', True
                         log.append({'kind': 'rejected', 'reason': 'invalid_command'})
                         break
                     command = command.strip()
                     blocked = guard(command)
                     if blocked:
                         log.append({'kind': 'blocked', 'reason': blocked, 'command': command[:200]})
+                        round_records.append('blocked:' + blocked)
                         results.append(ToolCallMessageSegment(
                             tool_call_id=call_id,
                             content=json.dumps({'error': 'blocked', 'reason': blocked,
@@ -368,11 +388,22 @@ class SandboxAgent:
                         continue
                     actions_here = count_device_actions(command)
                     device_actions += actions_here
-                    command_counts[command] = command_counts.get(command, 0) + 1
                     left = remaining()
                     effective = command_timeout if left is None else max(5, min(command_timeout, int(left) - 5))
                     result = await self._shell(command, effective)
                     log.count += 1
+                    signature = json.dumps(
+                        [result['exit_code'], result['stdout'], result['stderr']],
+                        ensure_ascii=False, sort_keys=True,
+                    )
+                    if command_signatures.get(command) == signature:
+                        command_counts[command] = command_counts.get(command, 0) + 1
+                    else:
+                        command_counts[command] = 1
+                        command_signatures[command] = signature
+                    if (not actions_here or result['stdout'].strip() or result['stderr'].strip()
+                            or result['exit_code'] not in (0, None)):
+                        round_records.append(signature)
                     log.append({'kind': 'command', 'command': command, **result})
                     recent.append((command, result['exit_code']))
                     failure_streak = failure_streak + 1 if result['exit_code'] not in (0, None) else 0
@@ -387,34 +418,40 @@ class SandboxAgent:
                         tool_calls_result=results,
                     ).to_openai_messages_model())
                     compact_results(messages)
-                    if device_actions > round_actions:
-                        has_acted = True
-                        idle_rounds = 0
-                    else:
-                        idle_rounds += 1
+                    if work_context is not None:
+                        work_context.save(messages)
+                    if round_records:
+                        current_round = tuple(round_records)
+                        idle_rounds = idle_rounds + 1 if current_round == previous_round else 0
+                        previous_round = current_round
                     repeated = any(count >= MAX_REPEATS for count in command_counts.values())
                     if repeated:
                         stop_reason = 'repeated_command'
                     elif failure_streak >= MAX_FAILED_COMMANDS:
                         stop_reason = 'repeated_command_failure'
-                    elif needs_device_action and has_acted and idle_rounds >= MAX_IDLE_ROUNDS:
+                    elif needs_device_action and idle_rounds >= MAX_IDLE_ROUNDS:
                         stop_reason = 'no_progress'
-                    elif needs_device_action and not has_acted and idle_rounds >= MAX_IDLE_BEFORE_ACTION:
-                        stop_reason = 'no_action_ever'
                     if stop_reason:
                         status, reason = 'needs_parent', stop_reason
                         summary = describe_stop(stop_reason, recent)
                         log.append({'kind': 'gave_up', 'reason': stop_reason,
-                                    'rounds_without_action': idle_rounds})
+                                    'rounds_without_change': idle_rounds})
                         break
                 if rejected:
                     break
         except asyncio.CancelledError:
+            if work_context is not None:
+                work_context.save(messages)
             log.save({'task_id': log.task_id, 'status': 'cancelled'})
             raise
         except Exception as exc:
             status = 'failed'
             summary = (type(exc).__name__ + ': ' + str(exc))[:MAX_SUMMARY_CHARS]
+        if not summary:
+            reason = reason or status
+            summary = describe_stop(reason, recent)
+        if work_context is not None:
+            work_context.save(messages)
         result = {
             'task_id': log.task_id,
             'status': status,

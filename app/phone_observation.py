@@ -276,7 +276,10 @@ async def observe_phone(execute_command) -> PhoneObservation:
     output = envelope.get('stdout')
     if not isinstance(output, str) or len(output) > 6_000_000:
         raise ValueError('invalid_capture_output')
-    capture = json.loads(output)
+    try:
+        capture = json.loads(output)
+    except ValueError:
+        raise ValueError('invalid_capture_output') from None
     before, after = foreground(capture['before']), foreground(capture['after'])
     if before != after:
         raise ValueError('activity_changed_during_capture')

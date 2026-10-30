@@ -8,6 +8,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.agent.tool import FunctionTool
 
 from .app.adapter import SNAPSHOT_KEY, TOOL_NAME, CapabilityBackend, build_backend, resolve_actions
+from .app.background import BackgroundTasks, FollowupInbox
 from .app.comment_submit import CommentSubmitter, validate_comment
 from .app.event_ledger import EventLedger
 from .app.execution import IndependentExecution
@@ -19,6 +20,17 @@ from .app.publish import (
 )
 from .app.redaction import sanitize_text
 from .app.subagent import SANDBOX_WORKER_PROTOCOL, SandboxAgent, request_stop
+from .app.task_store import TaskStore
+from .app.work_context import WorkContext
+
+BACKGROUND_CAPABILITIES = frozenset({
+    'phone_agent', 'sandbox_worker', 'post_publish', 'post_delete', 'comment_publish',
+})
+# A finished round may be continued, but never one whose external effect is
+# unknown: resuming would invite the executor to redo it.
+CONTINUABLE_STATUSES = frozenset({
+    'completed', 'needs_parent', 'step_limit', 'time_budget', 'stopped',
+})
 
 
 class OperationTool(FunctionTool):
@@ -27,13 +39,15 @@ class OperationTool(FunctionTool):
             name=TOOL_NAME,
             description=(
                 'Two persona-free helpers run off this one tool. Neither writes, polishes or completes anything '
-                'on your behalf. Raw commands and screen dumps stay on disk; you get one short summary and an '
-                'evidence path. '
+                'on your behalf. Raw commands and screen dumps stay on disk; what comes back is a short summary '
+                'and an evidence path. '
                 'phone_agent drives the Android phone through adb: read the screen tree, tap, swipe, type, open '
-                'the app. Omit actions and this is what you get. Its commands are screened first; clearing app '
-                'data, changing settings, installing packages, rebooting and non-input broadcasts are refused. '
+                'the app. Omit actions and this is what you get. It runs in the background; its result is kept, '
+                'not pushed into this conversation, so read it with operation_context_task when you want it. '
+                'Its commands are screened first; clearing '
+                'app data, changing settings, installing packages, rebooting and non-input broadcasts are refused. '
                 'sandbox_worker works only inside the Linux workspace: files, notes, diary, scripts, calculation. '
-                'Describe the job in plain language. It never touches the phone. '
+                'It also runs in the background. Describe the job in plain language. It never touches the phone. '
                 'Put any text that must be stored or typed byte for byte in input_text; neither helper may rewrite '
                 'it, and neither may touch QQ. '
                 'Single-purpose actions: phone_observe and phone_events look at the screen and read the reply '
@@ -42,10 +56,13 @@ class OperationTool(FunctionTool):
                 'post_publish takes the title in post_title and the body in post_text: the helper fills the '
                 'editor, then the host verifies and submits. comment_publish takes the body in input_text and an '
                 'optional nickname in post_mention: the helper fills the comment box, then the host verifies and '
-                'sends. post_delete removes one of your own posts by exact title; post_submit commits an editor '
-                'you filled by hand. '
+                'sends. Both start in the background; their results are kept, so read them with '
+                'operation_context_task. post_delete removes one of your own posts '
+                'by exact title and also runs in the background; post_submit commits an editor you filled by hand. '
                 'note_read and note_write read or save one note or diary file named by note_path. '
-                'Anything that can be seen by someone outside this conversation has to be used alone. '
+                'phone_events, note_read, note_write and anything that can be seen outside this conversation '
+                'must be the only action in its call. phone_observe can share a call with navigation actions, '
+                'but not with phone_events. '
                 'Handle anything outside this scope yourself.'
             ),
             parameters={
@@ -61,26 +78,56 @@ class OperationTool(FunctionTool):
                     'post_mention': {'type': 'string', 'maxLength': 50, 'description': 'Optional nickname to mention with the native picker, for post_publish or comment_publish.'},
                     'note_path': {'type': 'string', 'maxLength': 200, 'description': 'For note_read and note_write: path relative to her workspace, such as notes/某笔记.md or diary/2026-10/2026-10-27.md.'},
                     'note_mode': {'type': 'string', 'enum': ['create', 'append', 'replace'], 'description': 'For note_write: create fails if the file exists, append adds to it, replace backs it up first.'},
+                    'task_id': {'type': 'string', 'maxLength': 64, 'description': 'Optional. Continue that finished background task from its saved work history instead of starting blind.'},
                 },
                 'required': ['goal'], 'additionalProperties': False,
             },
         )
         self.owner = owner
 
-    async def call(self, context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None, note_path: str | None = None, note_mode: str | None = None) -> str:
-        return await self.owner.execute(context, goal, actions, input_text, expect_text, post_title, post_text, post_images, post_mention, note_path, note_mode)
+    async def call(self, context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None, note_path: str | None = None, note_mode: str | None = None, task_id: str | None = None) -> str:
+        return await self.owner.execute(context, goal, actions, input_text, expect_text, post_title, post_text, post_images, post_mention, note_path, note_mode, task_id)
+
+
+class TaskTool(FunctionTool):
+    def __init__(self, owner):
+        super().__init__(
+            name='operation_context_task',
+            description=(
+                'Check, stop, supplement or read background work started by operation_context_run. '
+                'phone_agent, sandbox_worker, post_publish, comment_publish and post_delete start in the '
+                'background and return a task_id at once; nothing is pushed into this conversation when they '
+                'end, so read the result when you want it. '
+                'status lists what is running here; stop ends one task and keeps its partial result; '
+                'say adds one requirement to a task that is still running; result returns the saved '
+                'summary and evidence path.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'action': {'type': 'string', 'enum': ['status', 'stop', 'say', 'result']},
+                    'task_id': {'type': 'string', 'maxLength': 64},
+                    'text': {'type': 'string', 'maxLength': 1000, 'description': 'For say: the added requirement, in plain language. It is accepted at once and consumed before the next round.'},
+                },
+                'required': ['action'], 'additionalProperties': False,
+            },
+        )
+        self.owner = owner
+
+    async def call(self, context, action: str, task_id: str | None = None, text: str | None = None) -> str:
+        return await self.owner.manage_tasks(context, action, task_id, text)
 
 
 class TaskRequest:
     __slots__ = (
         'run_context', 'shell', 'goal', 'permitted', 'input_text', 'expect_text',
         'post_title', 'post_text', 'post_images', 'post_mention', 'note_path', 'note_mode',
-        'time_budget',
+        'time_budget', 'task_id', 'resume', 'consumed_followups',
     )
 
     def __init__(self, *, run_context, shell, goal, permitted, input_text, expect_text,
                  post_title, post_text, post_images, post_mention, note_path, note_mode,
-                 time_budget):
+                 time_budget, task_id=None, resume=None):
         self.run_context = run_context
         self.shell = shell
         self.goal = goal
@@ -94,6 +141,9 @@ class TaskRequest:
         self.note_path = note_path
         self.note_mode = note_mode
         self.time_budget = time_budget
+        self.task_id = task_id
+        self.resume = resume
+        self.consumed_followups: list[str] = []
 
 
 @register('astrbot_plugin_operation_context', 'Moebius', '无人格的受限沙箱与手机执行接口', '0.2.0')
@@ -101,8 +151,9 @@ class OperationContextPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
+        self.data_dir = StarTools.get_data_dir('astrbot_plugin_operation_context')
         self.executor = IndependentExecution(
-            StarTools.get_data_dir('astrbot_plugin_operation_context') / 'tasks', sanitize_text,
+            self.data_dir / 'tasks', sanitize_text,
         )
         self.standalone_handlers = {
             'phone_agent': self.handle_agent,
@@ -119,9 +170,15 @@ class OperationContextPlugin(Star):
         self.poller = None
         self.phone_busy = False
         self.workspace_access = WorkspaceAccess()
-        self.context.add_llm_tools(OperationTool(self))
+        self.tasks = TaskStore(self.data_dir / 'task_state')
+        self.background = BackgroundTasks()
+        self.followups = FollowupInbox()
+        self.context.add_llm_tools(OperationTool(self), TaskTool(self))
 
     async def initialize(self) -> None:
+        interrupted = await self.tasks.interrupt_running()
+        if interrupted:
+            logger.info('Marked %s unfinished task(s) interrupted; they will not replay.', len(interrupted))
         if not self.config.get('ledger_enabled'):
             return
         data_dir = StarTools.get_data_dir('astrbot_plugin_operation_context')
@@ -135,6 +192,7 @@ class OperationContextPlugin(Star):
         logger.info('Notification ledger polling every %s seconds', self.poller.interval)
 
     async def terminate(self) -> None:
+        await self.background.shutdown()
         if self.poller is not None:
             await self.poller.stop()
             self.poller = None
@@ -153,14 +211,40 @@ class OperationContextPlugin(Star):
             yield event.plain_result('只有管理员可以停止手机任务。')
             return
         request_stop()
+        umo = event.unified_msg_origin
+        stopped = []
+        for task_id in self.background.ids():
+            record = await self.tasks.get(task_id)
+            if record is not None and record.get('umo') == umo and self.background.cancel(task_id):
+                stopped.append(task_id)
+        if stopped:
+            yield event.plain_result(f'已请求停止 {len(stopped)} 个后台任务，结果会再报回来。')
+            return
         yield event.plain_result('已请求停止，执行器会在下一轮开始时收手，把已完成的部分交回来。')
 
-    async def execute(self, run_context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None, note_path: str | None = None, note_mode: str | None = None) -> str:
+    async def execute(self, run_context, goal: str, actions: list[str] | None = None, input_text: str | None = None, expect_text: str | None = None, post_title: str | None = None, post_text: str | None = None, post_images: list[str] | None = None, post_mention: str | None = None, note_path: str | None = None, note_mode: str | None = None, task_id: str | None = None) -> str:
         owns_phone = False
         try:
             if not isinstance(goal, str) or not goal.strip() or len(goal) > 4000:
                 raise ValueError('invalid_goal')
             permitted, outward = resolve_actions(actions, self.config.get('allowed_capabilities', []))
+            resume = None
+            if task_id:
+                if outward not in BACKGROUND_CAPABILITIES:
+                    raise ValueError('continuation_requires_background_capability')
+                umo = run_context.context.event.unified_msg_origin
+                record = await self.tasks.get(task_id)
+                if record is None or record.get('umo') != umo:
+                    raise ValueError('unknown_task')
+                if record.get('status') not in CONTINUABLE_STATUSES:
+                    raise ValueError('task_not_continuable')
+                resume = WorkContext(self.data_dir / 'work_contexts', task_id).load()
+                if not resume:
+                    raise ValueError('no_work_context')
+                goal = (
+                    f'This continues an earlier round that ended with status {record.get("status")}. '
+                    'Its record is above. Do not repeat any action whose result was not confirmed.\n' + goal
+                )
             needs_phone = bool(set(permitted) - {
                 'sandbox_status', 'phone_events', 'note_read', 'note_write', 'sandbox_worker',
             })
@@ -171,6 +255,19 @@ class OperationContextPlugin(Star):
                         'needs_parent': True, 'external_action_status': 'not_attempted',
                     })
                 self.phone_busy = owns_phone = True
+            if outward in BACKGROUND_CAPABILITIES:
+                self._validate_outward(
+                    outward, input_text, expect_text, post_title, post_text,
+                    post_images, post_mention, note_path, note_mode,
+                )
+                reply = await self._dispatch_background(
+                    run_context, goal, permitted, outward, input_text, expect_text,
+                    post_title, post_text, post_images, post_mention,
+                    resume=resume, parent_task_id=task_id,
+                )
+                # The handle that runs the work owns the phone from here on.
+                owns_phone = False
+                return reply
             return await self._dispatch(
                 run_context, goal, permitted, outward, input_text, expect_text,
                 post_title, post_text, post_images, post_mention, note_path, note_mode,
@@ -190,6 +287,9 @@ class OperationContextPlugin(Star):
                 'unexpected_input_text', 'unexpected_post_fields', 'input_text_required',
                 'invalid_expect_text', 'invalid_note_path', 'note_path_outside_allowed_dirs',
                 'invalid_note_mode', 'invalid_note_content', 'note_read_failed', 'note_write_failed',
+                'invalid_capture_output', 'phone_capture_failed', 'invalid_shell_envelope',
+                'shell_execution_refused', 'continuation_requires_background_capability',
+                'unknown_task', 'task_not_continuable', 'no_work_context',
             }
             if reason not in known:
                 reason = 'invalid_request'
@@ -239,6 +339,221 @@ class OperationContextPlugin(Star):
                 raise ValueError('unexpected_note_fields')
             return await self.run_fixed(request)
 
+    def background_budget(self) -> float:
+        limit = self.config.get('background_task_timeout', 900)
+        if isinstance(limit, bool) or not isinstance(limit, (int, float)) or limit <= 0:
+            return 900.0
+        return float(min(max(60, limit), 3600))
+
+    def _validate_outward(self, outward, input_text, expect_text, post_title,
+                          post_text, post_images, post_mention, note_path, note_mode) -> None:
+        """Refuse bad requests before work is handed to the background.
+
+        The same checks stay in the handlers; here they only spare the user a
+        task id for something that could never run.
+        """
+        if outward == 'phone_agent':
+            if any(value is not None for value in (expect_text, post_title, post_text)):
+                raise ValueError('unexpected_text_fields')
+            if input_text is not None and (
+                not isinstance(input_text, str) or not input_text.strip() or len(input_text) > 2000
+            ):
+                raise ValueError('invalid_input_text')
+        elif outward == 'sandbox_worker':
+            if any(value is not None for value in (
+                expect_text, post_title, post_text, post_images, post_mention,
+                note_path, note_mode,
+            )):
+                raise ValueError('unexpected_text_fields')
+            if input_text is not None and (
+                not isinstance(input_text, str) or not input_text.strip()
+                or len(input_text) > 2000
+            ):
+                raise ValueError('invalid_input_text')
+        elif outward == 'post_publish':
+            if input_text is not None or expect_text is not None:
+                raise ValueError('unexpected_text_fields')
+            validate_publish(post_title, post_text, post_images, post_mention)
+        elif outward == 'comment_publish':
+            if any(value is not None for value in (
+                expect_text, post_title, post_text, post_images,
+            )):
+                raise ValueError('unexpected_text_fields')
+            validate_comment(input_text)
+        elif outward == 'post_delete':
+            if any(value is not None for value in (input_text, expect_text, post_text)):
+                raise ValueError('unexpected_text_fields')
+            if not isinstance(post_title, str) or not post_title.strip() or len(post_title) > 100:
+                raise ValueError('invalid_post_title')
+
+    async def _dispatch_background(self, run_context, goal, permitted, outward,
+                                   input_text, expect_text, post_title, post_text,
+                                   post_images, post_mention, resume=None,
+                                   parent_task_id=None) -> str:
+        event = run_context.context.event
+        umo = event.unified_msg_origin
+        conversation_id = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        shell = build_backend(run_context, self.context, event.get_extra(SNAPSHOT_KEY))
+        record = await self.tasks.create(
+            umo=umo, conversation_id=conversation_id,
+            kind=outward, description=goal,
+        )
+        request = TaskRequest(
+            run_context=run_context, shell=shell,
+            goal=goal, permitted=permitted, input_text=input_text, expect_text=expect_text,
+            post_title=post_title, post_text=post_text, post_images=post_images,
+            post_mention=post_mention, note_path=None, note_mode=None,
+            time_budget=self.background_budget(), task_id=record['task_id'], resume=resume,
+        )
+        if parent_task_id:
+            await self.tasks.update(record['task_id'], parent_task_id=parent_task_id)
+        self.background.spawn(record['task_id'], self._run_background(record, request))
+        return json.dumps({
+            'status': 'dispatched',
+            'task_id': record['task_id'],
+            'kind': outward,
+            'note': 'Started in the background.',
+        }, ensure_ascii=False)
+
+    async def _run_background(self, record: dict, request: TaskRequest) -> None:
+        task_id = record['task_id']
+        owns_phone = record['kind'] != 'sandbox_worker'
+        budget = self.background_budget()
+        started = asyncio.get_running_loop().time()
+        try:
+            await self.tasks.update(task_id, status='running')
+            async with asyncio.timeout(budget):
+                handler = self.standalone_handlers[record['kind']]
+                if record['kind'] == 'sandbox_worker':
+                    async with self.workspace_access.worker():
+                        request.time_budget = budget - (asyncio.get_running_loop().time() - started)
+                        raw = await handler(request)
+                else:
+                    raw = await handler(request)
+            result = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(result, dict):
+                result = {}
+            status, summary = self._background_outcome(record['kind'], result)
+            await self.tasks.update(
+                task_id, status=status,
+                summary=summary, result=self._bounded_result(result),
+            )
+        except asyncio.CancelledError:
+            await self.tasks.update(
+                task_id, status='stopped',
+                summary='Stopped at the request of the host. Look at the phone before continuing.',
+            )
+        except TimeoutError:
+            await self.tasks.update(
+                task_id, status='time_budget',
+                summary='The task used its whole background budget and was stopped.',
+            )
+        except Exception as exc:
+            logger.warning('Background task failed: %s', type(exc).__name__)
+            await self.tasks.update(
+                task_id, status='failed',
+                summary=f'The task failed: {type(exc).__name__}',
+            )
+        finally:
+            if owns_phone:
+                self.phone_busy = False
+            consumed = list(request.consumed_followups)
+            if consumed:
+                await self.tasks.update(task_id, followups_consumed=consumed)
+            self.followups.discard(task_id)
+
+    @staticmethod
+    def _background_outcome(kind: str, result: dict) -> tuple[str, str | None]:
+        """One status and one short sentence for the parent.
+
+        A submission that was attempted but not confirmed is never reported as
+        done: the host cannot tell whether it landed.
+        """
+        if kind not in ('post_publish', 'comment_publish'):
+            return result.get('status') or 'failed', result.get('summary')
+        preparation = result.get('preparation') or {}
+        submit = result.get('submit') or {}
+        if preparation.get('status') != 'completed':
+            return 'needs_parent', preparation.get('summary')
+        if submit.get('status') == 'confirmed':
+            return 'completed', 'Preparation and submission were confirmed on the page.'
+        if submit.get('status') == 'unknown':
+            return 'needs_parent', 'Submission was attempted but not confirmed. Look at the phone before doing anything else.'
+        return 'needs_parent', 'Preparation finished but nothing was submitted.'
+
+    @staticmethod
+    def _bounded_result(result: dict) -> dict:
+        keys = (
+            'task_id', 'status', 'reason', 'summary', 'command_count',
+            'device_action_count', 'external_action_status', 'raw_record',
+        )
+        bounded = {key: result[key] for key in keys if key in result}
+        for key in ('preparation', 'submit'):
+            value = result.get(key)
+            if isinstance(value, dict):
+                bounded[key] = {
+                    field: value[field] for field in (
+                        'status', 'reason', 'summary', 'command_count',
+                        'raw_record', 'object_id_verified',
+                    ) if field in value
+                }
+        return bounded
+
+    @staticmethod
+    def _public_record(record: dict) -> dict:
+        keys = ('task_id', 'kind', 'status', 'summary', 'description', 'created_at')
+        public = {key: record.get(key) for key in keys}
+        public['followups_accepted'] = len(record.get('followups') or [])
+        public['followups_consumed'] = len(record.get('followups_consumed') or [])
+        if record.get('parent_task_id'):
+            public['continues'] = record['parent_task_id']
+        return public
+
+    async def manage_tasks(self, run_context, action: str, task_id: str | None = None,
+                           text: str | None = None) -> str:
+        umo = run_context.context.event.unified_msg_origin
+        if action == 'status':
+            records = await self.tasks.list_for(umo)
+            running = [
+                self._public_record(record) for record in records
+                if record.get('status') in ('queued', 'running')
+            ]
+            recent = [
+                self._public_record(record) for record in records
+                if record.get('status') not in ('queued', 'running')
+            ][:3]
+            return json.dumps({'running': running, 'recent': recent}, ensure_ascii=False)
+        if action not in ('stop', 'result', 'say'):
+            return json.dumps({'status': 'rejected', 'reason': 'invalid_task_action'})
+        record = await self.tasks.get(task_id)
+        if record is None or record.get('umo') != umo:
+            return json.dumps({'status': 'rejected', 'reason': 'unknown_task'})
+        if action == 'say':
+            if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+                return json.dumps({'status': 'rejected', 'reason': 'invalid_followup_text'})
+            if self.background.get(task_id) is None or record.get('status') not in ('queued', 'running'):
+                return json.dumps({'status': 'rejected', 'reason': 'task_not_running'})
+            self.followups.push(task_id, text.strip())
+            accepted = list(record.get('followups') or [])
+            accepted.append(text.strip())
+            await self.tasks.update(task_id, followups=accepted)
+            return json.dumps({
+                'status': 'accepted', 'task_id': task_id,
+                'note': 'Added to the task. Acceptance is not consumption; it is read before the next round.',
+            }, ensure_ascii=False)
+        if action == 'stop':
+            stopped = self.background.cancel(task_id)
+            if not stopped:
+                request_stop()
+            return json.dumps({
+                'status': 'stopping' if stopped else 'not_running',
+                'task_id': task_id,
+            }, ensure_ascii=False)
+        return json.dumps({
+            'status': 'ok', 'task': self._public_record(record),
+            'result': record.get('result'),
+        }, ensure_ascii=False)
+
     async def provider_id(self, event) -> str:
         configured = self.config.get('executor_provider')
         if isinstance(configured, str) and configured.strip():
@@ -250,11 +565,23 @@ class OperationContextPlugin(Star):
             request.shell, request.run_context,
             StarTools.get_data_dir('astrbot_plugin_operation_context') / evidence_dir,
         )
+        task_id = request.task_id
+        work_context = None
+        take_followups = None
+        if task_id:
+            work_context = WorkContext(self.data_dir / 'work_contexts', task_id)
+
+            def take_followups():
+                texts = self.followups.drain(task_id)
+                request.consumed_followups.extend(texts)
+                return texts
+
         return await agent.run(
             context=self.context, provider_id=await self.provider_id(request.run_context.context.event),
             goal=goal, max_steps=self.config.get('max_steps', 30),
             command_timeout=self.config.get('tool_call_timeout', 60),
-            time_budget=request.time_budget, **kwargs,
+            time_budget=request.time_budget, resume=request.resume,
+            work_context=work_context, take_followups=take_followups, **kwargs,
         )
 
     async def submitter(self, request: TaskRequest) -> PostSubmitter:

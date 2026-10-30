@@ -293,7 +293,10 @@ class IndependentExecution:
                 hooks.save_result({'task_id': hooks.task_id, 'status': 'cancelled', 'external_action_status': 'not_attempted'})
                 raise
             except Exception as exc:
-                status, reason = 'failed', type(exc).__name__
+                reason = type(exc).__name__
+                if isinstance(exc, ValueError) and str(exc):
+                    reason = str(exc).partition(':')[0]
+                status = 'failed'
                 hooks.append('task_error', error_type=reason)
             last = observations[-1] if observations else None
             expect_found = None

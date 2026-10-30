@@ -215,6 +215,20 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises((ValueError, TypeError)):
                 await CapabilityBackend(shell, object()).execute(action)
 
+    async def test_refused_shell_is_reported_as_a_permission_problem(self):
+        shell = SimpleNamespace(call=AsyncMock(
+            return_value='error: Permission denied. Shell execution is only allowed for admin users.',
+        ))
+        with self.assertRaises(ValueError) as raised:
+            await CapabilityBackend(shell, object()).execute('phone_status')
+        self.assertEqual(str(raised.exception), 'shell_execution_refused')
+
+    async def test_non_json_shell_output_is_not_mistaken_for_a_result(self):
+        shell = SimpleNamespace(call=AsyncMock(return_value='not json at all'))
+        with self.assertRaises(ValueError) as raised:
+            await CapabilityBackend(shell, object()).execute('phone_status')
+        self.assertEqual(str(raised.exception), 'shell_execution_refused')
+
     def test_bay_command_uses_exact_device_and_read_only_scope(self):
         self.assertIn("'-s', '172.22.0.2:5555'", _APP_SCOPE_SCRIPT)
         self.assertNotIn('send_message_to_user', COMMANDS['phone_app_scope'])

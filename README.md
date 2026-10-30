@@ -142,6 +142,9 @@ app/                 实现模块
   post_submit.py     发帖提交
   comment_submit.py  评论提交
   publish.py         发帖与评论的任务目标与规则
+  task_store.py      任务记录
+  work_context.py    单个任务的工作过程，供接续使用
+  background.py      后台任务句柄与运行中补充收件箱
   event_ledger.py    通知事件账本
   notification_poll.py 定时读取通知
   threat_detector.py 提示词注入检测（第三方，见文末致谢）
@@ -158,12 +161,17 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
 
 一次任务内执行器保留完整对话历史，记得自己跑过什么、看到过什么，不会每轮从零重算。早先的工具输出会被压缩成摘要，最近八条保留原文。
 
-两条路径共用同一个时间预算：AstrBot 给单次工具调用的 `tool_call_timeout` 减去十秒。预算将尽时执行器不再开新一轮，直接返回 `time_budget` 和已完成的部分，而不是被外层杀掉。
+两条路径的时间预算不同。后台任务（`phone_agent`、`sandbox_worker`、`post_publish`、`post_delete`、`comment_publish`）用 `background_task_timeout`，默认 900 秒；同步调用仍用 AstrBot 的 `tool_call_timeout` 减去十秒。预算将尽时执行器不再开新一轮，直接返回 `time_budget` 和已完成的部分，而不是被外层杀掉。
 
-执行器会自己认输，不再一路空转到步数耗尽。命中任一条件就停下并返回 `needs_parent` 和一份错误报告：
-相同命令执行第三次；连续三轮没有任何设备动作；连续三条命令非零退出。
+执行器会自己认输，但判据看的是有没有新信息，不是有没有动作。命中任一条件才停下并返回 `needs_parent`：
 
-`status` 取值：`completed`、`needs_parent`、`time_budget`、`stopped`、`rejected`、`failed`。`reason` 写明具体原因，例如 `repeated_command`、`repeated_command_failure`、`no_progress`、`parent_requested_stop`。
+- 同一条命令连续三次返回完全相同的输出；
+- 连续六轮观察到的东西完全一样（命令和退出码、输出都比过）；
+- 连续三条命令非零退出。
+
+只读侦察不算空转：每轮读到不同内容就继续。执行次数和总时间仍由 `max_steps` 与预算兜底。
+
+`status` 取值：`completed`、`needs_parent`、`time_budget`、`stopped`、`rejected`、`failed`。`reason` 写明具体原因，例如 `repeated_command`、`repeated_command_failure`、`no_progress`、`parent_requested_stop`。原来的 `no_action_ever` 已取消：只读观察不再因为没有点击而被判停。
 
 ### 急停
 
@@ -216,7 +224,8 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
 - 评论由 `comment_publish` 处理，宿主核对评论框内容后才发送。
 - 没有跨通道的手机互斥：主对话直接跑 adb 时插件不知情。
 - 命令闸是黑名单，只拒绝已知的破坏性命令；放行不等于安全。
-- 一次工具调用最多活到 AstrBot 的 `tool_call_timeout`（当前 120 秒，见 `data/cmd_config.json` 的 `provider_settings`）。插件留了十秒余量自行收尾。实测一次发帖准备 55 秒、一次评论 64 秒，都在这条线以内，不需要调大全局值。
+- 后台任务不受单次工具调用超时限制，但同步调用仍受 `tool_call_timeout`（当前 120 秒，见 `data/cmd_config.json` 的 `provider_settings`）约束。实测一次发帖准备 55 秒、一次评论 64 秒，以前在这条线以内；现在发帖和评论已改为后台任务，默认 900 秒预算。
+- 2026-10-29 已在运行环境重载并做真机验证：查询路径成功；两次 `phone_agent` 后台派发与执行走通。两次都停在旧认输规则上，该规则已于同日改为按“有没有新信息”判断。
 - 没有检测真人接管手机。手机目前只有执行器在用，这条规则等出现并发使用者再做。
 - 状态未知一律不重试，需要人工或主对话先观察确认。
 - 尚未完成干净环境部署与长期无人看护验收。
@@ -233,15 +242,27 @@ tests/               离线测试，用 _AI工作区/run_plugin_tests.py 运行
 
 `phone_events` 必须单独使用，不和其它能力混在一个任务里。
 
-### 任务互斥
+### 任务互斥与后台执行
+
+`phone_agent`、`sandbox_worker`、`post_publish`、`post_delete`、`comment_publish` 不阻塞当前回合：工具立刻返回 `dispatched` 和 `task_id`，任务在后台跑。查询、固定动作、`post_submit` 和笔记仍是同步调用。
+
+任务结束不会自动叫醒主对话。插件不发起额外的模型调用，也不替主对话说话；结果只写进任务记录，主对话想用时自己读。
 
 手机同一时间只接受一个需要设备的插件任务。锁覆盖准备、校验、提交和读回；设备忙时，新的手机调用立即返回 `busy` 和 `another_phone_task_running`。
 
 事件账本、容量查询、笔记和工作区任务不占手机锁。笔记按规范化后的路径互斥，不同笔记可并行。自由工作区任务未声明具体目标文件，因此执行期间独占插件文件访问，避免与笔记操作互相覆盖；这不是沙箱权限隔离，也管不到白直接运行的 shell。
 
+`operation_context_task` 可以在任务结束前查状态、补充要求、停止或读取已保存的结果。`say` 把一条补充要求加进正在跑的任务，立即确认接收，在下一轮之前才真正交给执行器；接收与消费分别记录。停止会取消后台句柄，已完成的轮次保留；正在执行的远程命令不保证立即中止，继续操作前先看手机。
+
+后台任务的工作过程按任务号存在 `plugin_data/astrbot_plugin_operation_context/work_contexts/`。已经结束的任务可以在下一次调用时带 `task_id` 接着做，执行器会先看到上一轮跑过什么、看过什么，不用从零开始。只有 `completed`、`needs_parent`、`step_limit`、`time_budget`、`stopped` 可以接续；中断或状态未知的任务不允许接续，避免它把没确认的动作重做一遍。接续会新建一条任务记录，用 `parent_task_id` 指向原任务。
+
+插件重启时仍在跑的任务标记为 `interrupted`，不自动重放：宿主无法知道最后一步对外动作是否发生。
+
+后台任务的总预算由 `background_task_timeout` 控制，默认 900 秒；单条命令仍用 `tool_call_timeout`。没有为容纳长任务修改 AstrBot 全局 `tool_call_timeout`。
+
 冻结文件保存在 `/tmp/operation-context/<task_id>/`，执行器从本次载荷的 `frozen_text_file` 和 `frozen_files` 获取路径，不复用其他任务的原文。创建失败时不会启动模型。笔记 replace 的备份名包含时间和随机标识，同秒多次覆盖也不会覆盖旧备份。
 
-发帖、评论和删除会保留主对话的原始目标；准备与最终提交的分工不变。已知请求错误返回具体 `reason`，异常原文不进入主对话；执行失败或超时按状态未知处理，不据此自动重试。资源等待计入现有调用预算，本版本仍是同步调用，不具备持久任务或异步回传。
+发帖、评论和删除会保留主对话的原始目标；准备与最终提交的分工不变。已知请求错误返回具体 `reason`，异常原文不进入主对话；执行失败或超时按状态未知处理，不据此自动重试。资源等待计入调用预算。
 
 ## 安全与隐私
 

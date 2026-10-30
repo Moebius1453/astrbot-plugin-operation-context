@@ -233,7 +233,14 @@ class CapabilityBackend:
         raw = await self.shell.call(
             self.run_context, command=command, background=False, timeout=timeout,
         )
-        envelope = json.loads(raw)
+        if isinstance(raw, str) and not raw.lstrip().startswith('{'):
+            # The shell tool answers plain text when it refuses to run at all,
+            # for example when the sender is not an administrator.
+            raise ValueError('shell_execution_refused')
+        try:
+            envelope = json.loads(raw)
+        except ValueError:
+            raise ValueError('invalid_shell_envelope') from None
         if not isinstance(envelope, dict):
             raise ValueError('invalid_shell_envelope')
         return envelope
