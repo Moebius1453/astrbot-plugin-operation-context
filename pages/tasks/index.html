@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><script src="/api/plugin/page/bridge-sdk.js"></script><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>任务记录</title>
+<style>
+:root{color-scheme:light dark;font:15px system-ui}body{margin:0;background:Canvas;color:CanvasText}header{padding:18px 24px;border-bottom:1px solid GrayText}h1{font-size:20px;margin:0 0 6px}small{color:GrayText}main{display:grid;grid-template-columns:300px 1fr;min-height:75vh}nav{padding:16px;border-right:1px solid GrayText}article{padding:20px;min-width:0}button,input,textarea{font:inherit;padding:9px;border:1px solid GrayText;border-radius:6px;background:Canvas;color:CanvasText}button{cursor:pointer}nav button{display:block;width:100%;text-align:left;margin:8px 0;white-space:pre-wrap}nav button[aria-current=true]{border:2px solid Highlight}pre{white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;background:color-mix(in srgb,CanvasText 5%,Canvas);border-radius:6px}textarea{width:95%;min-height:65px}#error{color:firebrick}#search{width:90%}.controls{display:flex;gap:10px;margin:12px 0}@media(max-width:700px){main{grid-template-columns:1fr}nav{border-right:0;border-bottom:1px solid GrayText}}
+</style></head>
+<body><header><h1>执行任务</h1><small>任务事实与执行证据，不会唤醒白或发送聊天。最多显示最近 100 条任务，每 3 秒刷新。</small><p id="error" role="alert"></p></header>
+<main><nav><input id="search" aria-label="搜索任务" placeholder="搜索任务或编号"><div id="list"></div></nav><article><h2 id="title">选择一条任务</h2><p id="status"></p><pre id="summary"></pre><div class="controls"><button id="refresh">刷新</button><button id="stop" disabled>停止任务</button></div><label for="followup">补充要求</label><p><textarea id="followup"></textarea></p><button id="say" disabled>交给运行任务</button><p id="notice" role="status"></p><h3>最近执行记录</h3><pre id="events"></pre></article></main>
+<script>
+(async()=>{
+const bridge=window.AstrBotPluginPage; await bridge.ready();
+const base='/astrbot_plugin_operation_context/api';
+const el=id=>document.getElementById(id); let tasks=[],selected=null,busy=false;
+function unwrap(value){return value&&value.status==='ok'&&value.data!==undefined?value.data:value;}
+async function get(path){return unwrap(await bridge.apiGet(base+path));}
+async function post(path,data){return unwrap(await bridge.apiPost(base+path,data));}
+function render(){const q=el('search').value.toLowerCase();el('list').replaceChildren();for(const task of tasks){if(!(task.description+' '+task.task_id).toLowerCase().includes(q))continue;const b=document.createElement('button');b.textContent=task.kind+' · '+task.status+'\n'+task.description;b.setAttribute('aria-current',String(task.task_id===selected));b.onclick=()=>{selected=task.task_id;refresh()};el('list').appendChild(b);}}
+async function refresh(){if(busy)return;busy=true;try{const data=await get('/tasks');if(!Array.isArray(data.tasks))throw Error('任务列表格式不正确');tasks=data.tasks;render();if(selected){const detail=await post('/detail',{task_id:selected});if(detail.error)throw Error(detail.error);const r=detail.record;el('title').textContent=r.description;el('status').textContent=r.kind+' · '+r.status+' · '+r.updated_at;el('summary').textContent=r.summary||'尚无结论';el('events').textContent=JSON.stringify(detail.events,null,2);const active=['queued','running'].includes(r.status);el('stop').disabled=!active;el('say').disabled=!active;}el('error').textContent='';}catch(error){el('error').textContent='读取失败：'+error.message;}finally{busy=false;}}
+el('search').oninput=render;el('refresh').onclick=refresh;
+el('stop').onclick=async()=>{if(!selected||!confirm('停止该任务？远端命令不保证立即结束。'))return;try{const r=await post('/control',{task_id:selected,action:'stop'});el('notice').textContent=r.error||r.status;await refresh();}catch(e){el('error').textContent=e.message;}};
+el('say').onclick=async()=>{const text=el('followup').value.trim();if(!text||text.length>1000)return;try{const r=await post('/control',{task_id:selected,action:'say',text});if(r.error)throw Error(r.error);el('notice').textContent='已接收；是否消费以任务记录为准。';el('followup').value='';}catch(e){el('error').textContent=e.message;}};
+await refresh();const timer=setInterval(refresh,3000);window.addEventListener('unload',()=>clearInterval(timer));
+})();
+</script></body></html>

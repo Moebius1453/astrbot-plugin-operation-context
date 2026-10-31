@@ -102,6 +102,12 @@ class TaskStore:
         records.sort(key=lambda r: r.get('created_at') or '', reverse=True)
         return records[:limit]
 
+    async def list_all(self, limit: int = 100) -> list[dict]:
+        async with self._lock:
+            records = self._records()
+        records.sort(key=lambda r: r.get('created_at') or '', reverse=True)
+        return records[:limit]
+
     async def interrupt_running(self) -> list[str]:
         """Mark work that was running at shutdown as interrupted.
 

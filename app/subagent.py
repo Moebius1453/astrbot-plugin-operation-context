@@ -263,7 +263,7 @@ class SandboxAgent:
         frozen_files: dict | None = None, extra_rules: str | None = None,
         time_budget: float | None = None, protocol: str | None = None,
         needs_device_action: bool = True, resume: list[dict] | None = None,
-        work_context=None, take_followups=None,
+        work_context=None, take_followups=None, capture_artifact=None,
     ) -> dict:
         if not isinstance(goal, str) or not goal.strip() or len(goal) > 8000:
             raise ValueError('invalid_goal')
@@ -297,6 +297,14 @@ class SandboxAgent:
         previous_round = None
         recent = []
         stop_reason = None
+        artifacts = []
+        tools = [SHELL_TOOL]
+        if capture_artifact is not None:
+            tools.append(FunctionTool(
+                name='capture_artifact',
+                description='Save a screenshot as an artifact for the parent. Returns an artifact ID only; you do not see the image. Do not send it to anyone.',
+                parameters={'type': 'object', 'properties': {}, 'additionalProperties': False},
+            ))
         try:
             payloads = {}
             if frozen_text:
@@ -346,7 +354,7 @@ class SandboxAgent:
                         contexts=messages,
                         system_prompt=(protocol or SANDBOX_AGENT_PROTOCOL)
                         + (('\n' + extra_rules) if extra_rules else ''),
-                        tools=ToolSet([SHELL_TOOL]),
+                        tools=ToolSet(tools),
                     ), timeout=min(180, left) if left else 180,
                 )
                 names = getattr(response, 'tools_call_name', None) or []
@@ -362,14 +370,30 @@ class SandboxAgent:
                         status, reason = 'needs_parent', 'empty_final_response'
                     break
                 if len(names) > 4 or len(names) != len(arguments) or len(names) != len(call_ids) or any(
-                    not isinstance(name, str) or name != 'sandbox_shell' for name in names
+                    not isinstance(name, str) or name not in {tool.name for tool in tools} for name in names
                 ):
                     status, reason = 'rejected', 'invalid_tool_call'
                     log.append({'kind': 'rejected', 'names': names})
                     break
                 rejected = False
                 results = []
-                for argument, call_id in zip(arguments, call_ids):
+                for name, argument, call_id in zip(names, arguments, call_ids):
+                    if name == 'capture_artifact':
+                        if argument != {}:
+                            status, reason, rejected = 'rejected', 'invalid_tool_call', True
+                            break
+                        try:
+                            artifact_id = await capture_artifact()
+                            artifacts.append(artifact_id)
+                            receipt = {'artifact_id': artifact_id, 'status': 'saved'}
+                            log.append({'kind': 'artifact', **receipt})
+                        except (ValueError, OSError, TimeoutError):
+                            receipt = {'status': 'failed', 'reason': 'capture_failed'}
+                            log.append({'kind': 'artifact', **receipt})
+                        results.append(ToolCallMessageSegment(
+                            tool_call_id=call_id, content=json.dumps(receipt),
+                        ))
+                        continue
                     command = argument.get('command') if isinstance(argument, dict) else None
                     if not isinstance(command, str) or not command.strip() or len(command) > 2000:
                         status, reason, rejected = 'rejected', 'invalid_command', True
@@ -462,5 +486,7 @@ class SandboxAgent:
             'external_action_status': 'unknown' if log.count else 'not_attempted',
             'raw_record': str(log.directory),
         }
+        if artifacts:
+            result['artifacts'] = artifacts
         log.save(result)
         return result

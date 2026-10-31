@@ -6,6 +6,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.agent.tool import FunctionTool
+from astrbot.core.message.components import Image
 
 from .app.adapter import SNAPSHOT_KEY, TOOL_NAME, CapabilityBackend, build_backend, resolve_actions
 from .app.background import BackgroundTasks, FollowupInbox
@@ -21,6 +22,8 @@ from .app.publish import (
 from .app.redaction import sanitize_text
 from .app.subagent import SANDBOX_WORKER_PROTOCOL, SandboxAgent, request_stop
 from .app.task_store import TaskStore
+from .app.task_view import TASK_ID, read_task_evidence, refresh_task_receipts
+from .app.artifacts import Artifacts, ArtifactTool, capture
 from .app.work_context import WorkContext
 
 BACKGROUND_CAPABILITIES = frozenset({
@@ -118,6 +121,31 @@ class TaskTool(FunctionTool):
         return await self.owner.manage_tasks(context, action, task_id, text)
 
 
+class CaptureTool(FunctionTool):
+    def __init__(self, owner):
+        super().__init__(
+            name='operation_context_image',
+            description=(
+                'Capture the current phone screen or Linux desktop as a PNG artifact, '
+                'view a saved artifact, or send it to this conversation. '
+                'capture and view return the actual image to you, not to the user. '
+                'send sends only the original image, with no generated caption. '
+                'Use send only when you intend to share that image with the user. '
+                'The executor does not receive images or gain a vision channel.'
+            ),
+            parameters={'type': 'object', 'properties': {
+                'action': {'type': 'string', 'enum': ['capture', 'view', 'send']},
+                'source': {'type': 'string', 'enum': ['phone', 'sandbox']},
+                'artifact_id': {'type': 'string', 'maxLength': 32},
+            }, 'required': ['action'], 'additionalProperties': False},
+        )
+        self.owner = owner
+
+    async def call(self, context, action: str, source: str | None = None,
+                   artifact_id: str | None = None):
+        return await self.owner.manage_image(context, action, source, artifact_id)
+
+
 class TaskRequest:
     __slots__ = (
         'run_context', 'shell', 'goal', 'permitted', 'input_text', 'expect_text',
@@ -173,9 +201,14 @@ class OperationContextPlugin(Star):
         self.tasks = TaskStore(self.data_dir / 'task_state')
         self.background = BackgroundTasks()
         self.followups = FollowupInbox()
-        self.context.add_llm_tools(OperationTool(self), TaskTool(self))
+        self.artifacts = Artifacts(self.data_dir / 'artifacts')
+        self.context.add_llm_tools(OperationTool(self), TaskTool(self), CaptureTool(self))
 
     async def initialize(self) -> None:
+        prefix = '/astrbot_plugin_operation_context/api'
+        self.context.register_web_api(prefix + '/tasks', self.web_tasks, ['GET'], 'Task records')
+        self.context.register_web_api(prefix + '/detail', self.web_detail, ['POST'], 'Task evidence')
+        self.context.register_web_api(prefix + '/control', self.web_control, ['POST'], 'Task control')
         interrupted = await self.tasks.interrupt_running()
         if interrupted:
             logger.info('Marked %s unfinished task(s) interrupted; they will not replay.', len(interrupted))
@@ -204,6 +237,85 @@ class OperationContextPlugin(Star):
     async def capture_authorized_tools(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         tools = req.func_tool
         event.set_extra(SNAPSHOT_KEY, [tool.name for tool in tools.tools if tool.active] if tools else [])
+        conversation = getattr(req, 'conversation', None)
+        conversation_id = getattr(conversation, 'cid', None)
+        if conversation_id:
+            req.contexts = await refresh_task_receipts(
+                req.contexts, self.tasks, event.unified_msg_origin, conversation_id,
+            )
+
+    async def manage_image(self, run_context, action, source=None, artifact_id=None):
+        event = run_context.context.event
+        umo = event.unified_msg_origin
+        conversation_id = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        owns_phone = False
+        try:
+            if not event.is_admin():
+                raise ValueError('admin_required')
+            if action == 'capture':
+                if artifact_id is not None or source not in ('phone', 'sandbox'):
+                    raise ValueError('invalid_capture_request')
+                if source == 'phone':
+                    if self.phone_busy:
+                        return json.dumps({'status': 'busy', 'reason': 'another_phone_task_running'})
+                    self.phone_busy = owns_phone = True
+                shell = build_backend(run_context, self.context, event.get_extra(SNAPSHOT_KEY))
+                raw = await capture(shell, run_context, source)
+                artifact_id = self.artifacts.save_png(raw, umo, conversation_id, source)
+            elif action not in ('view', 'send') or source is not None:
+                raise ValueError('invalid_artifact_action')
+            path = self.artifacts.get(artifact_id, umo, conversation_id)
+            if action == 'send':
+                await event.send(event.chain_result([Image.fromFileSystem(str(path))]))
+                return json.dumps({'status': 'sent', 'artifact_id': artifact_id})
+            return ArtifactTool.image_result(artifact_id, path, run_context)
+        except (ValueError, OSError, TimeoutError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            known = {'admin_required', 'invalid_capture_request', 'invalid_capture_source',
+                     'invalid_artifact_action', 'unknown_artifact', 'image_too_large',
+                     'invalid_image', 'capture_failed', 'phone_outside_allowed_app',
+                     'desktop_not_running', 'desktop_capture_tool_missing'}
+            return json.dumps({'status': 'failed', 'reason': reason if reason in known else 'image_unavailable'})
+        finally:
+            if owns_phone:
+                self.phone_busy = False
+
+    async def web_tasks(self):
+        from quart import jsonify
+        return jsonify({'tasks': await self.tasks.list_all()})
+
+    async def web_detail(self):
+        from quart import jsonify, request
+        payload = await request.get_json()
+        task_id = payload.get('task_id') if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+            return jsonify({'error': 'unknown_task'}), 400
+        record = await self.tasks.get(task_id)
+        if record is None:
+            return jsonify({'error': 'unknown_task'}), 404
+        return jsonify(read_task_evidence(self.data_dir, record))
+
+    async def web_control(self):
+        from quart import jsonify, request
+        payload = await request.get_json()
+        task_id = payload.get('task_id') if isinstance(payload, dict) else None
+        if not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+            return jsonify({'error': 'unknown_task'}), 400
+        record = await self.tasks.get(task_id)
+        if record is None or record.get('status') not in ('queued', 'running'):
+            return jsonify({'error': 'task_not_running'}), 409
+        action = payload.get('action')
+        if action == 'stop':
+            return jsonify({'status': 'stopping' if self.background.cancel(task_id) else 'not_running'})
+        text = payload.get('text')
+        if action != 'say' or not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            return jsonify({'error': 'invalid_followup'}), 400
+        if self.background.get(task_id) is None:
+            return jsonify({'error': 'task_not_running'}), 409
+        self.followups.push(task_id, text.strip())
+        accepted = list(record.get('followups') or []) + [text.strip()]
+        await self.tasks.update(task_id, followups=accepted)
+        return jsonify({'status': 'accepted'})
 
     @filter.command('op_stop')
     async def stop_operation(self, event: AstrMessageEvent):
@@ -501,7 +613,7 @@ class OperationContextPlugin(Star):
 
     @staticmethod
     def _public_record(record: dict) -> dict:
-        keys = ('task_id', 'kind', 'status', 'summary', 'description', 'created_at')
+        keys = ('task_id', 'kind', 'status', 'summary', 'description', 'created_at', 'artifacts')
         public = {key: record.get(key) for key in keys}
         public['followups_accepted'] = len(record.get('followups') or [])
         public['followups_consumed'] = len(record.get('followups_consumed') or [])
@@ -576,12 +688,29 @@ class OperationContextPlugin(Star):
                 request.consumed_followups.extend(texts)
                 return texts
 
+        async def capture_artifact():
+            event = request.run_context.context.event
+            umo = event.unified_msg_origin
+            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            if task_id:
+                record = await self.tasks.get(task_id)
+                conversation_id = record.get('conversation_id') if record else conversation_id
+            source = 'sandbox' if evidence_dir == 'sandbox_worker' else 'phone'
+            raw = await capture(request.shell, request.run_context, source)
+            artifact_id = self.artifacts.save_png(raw, umo, conversation_id, source)
+            if task_id:
+                record = await self.tasks.get(task_id)
+                saved = list((record or {}).get('artifacts') or [])
+                await self.tasks.update(task_id, artifacts=saved + [artifact_id])
+            return artifact_id
+
         return await agent.run(
             context=self.context, provider_id=await self.provider_id(request.run_context.context.event),
             goal=goal, max_steps=self.config.get('max_steps', 30),
             command_timeout=self.config.get('tool_call_timeout', 60),
             time_budget=request.time_budget, resume=request.resume,
-            work_context=work_context, take_followups=take_followups, **kwargs,
+            work_context=work_context, take_followups=take_followups,
+            capture_artifact=capture_artifact, **kwargs,
         )
 
     async def submitter(self, request: TaskRequest) -> PostSubmitter:
